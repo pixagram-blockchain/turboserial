@@ -1,5 +1,5 @@
 /**
- * TurboSerial v5 - Ultra-Optimized JavaScript Serializer
+ * TurboSerial V 0.1.0 - Ultra-Optimized JavaScript Serializer
  * FULLY OPTIMIZED VERSION with SIMD-style patterns and enhanced type support
  */
 "use strict";
@@ -547,8 +547,9 @@ class SIMDProcessor {
  * Ultra-fast type detector with branchless operations
  */
 class UltraTypeDetector {
-  constructor() {
+  constructor(options = {}) {
     this.simdProcessor = new SIMDProcessor();
+    this.allowFunction = options.allowFunction || false;
     
     // Pre-computed maps for O(1) lookups
     this.constructorMap = new Map();
@@ -840,9 +841,12 @@ class UltraTypeDetector {
         break;
       }
       
-      // Check for methods
+      // Check for methods (only when allowFunction is enabled)
       if (typeof descriptor.value === 'function') {
-        hasMethods = true;
+        if (this.allowFunction) {
+          hasMethods = true;
+        }
+        // When allowFunction is false, functions are ignored entirely
       }
       
       // Check for non-default attributes
@@ -935,14 +939,20 @@ class TurboSerial {
       shareArrayBuffers: options.shareArrayBuffers !== false,
       simdOptimization: options.simdOptimization !== false,
       detectCircular: options.detectCircular !== false,
-      serializeFunctions: options.serializeFunctions || false, // NEW: function serialization option
-      preservePropertyDescriptors: options.preservePropertyDescriptors !== false, // NEW: descriptor preservation
+      allowFunction: options.allowFunction || false, // NEW: when false, no function storage/retrieval and no eval()
+      serializeFunctions: options.serializeFunctions || false, // function serialization option
+      preservePropertyDescriptors: options.preservePropertyDescriptors !== false, // descriptor preservation
       memoryPoolSize: options.memoryPoolSize || 65536,
       ...options
     };
 
+    // When allowFunction is false, force serializeFunctions off to prevent any eval() calls
+    if (!this.options.allowFunction) {
+      this.options.serializeFunctions = false;
+    }
+
     this.pool = new UltraMemoryPool(this.options.memoryPoolSize);
-    this.detector = new UltraTypeDetector();
+    this.detector = new UltraTypeDetector({ allowFunction: this.options.allowFunction });
     this.simdProcessor = new SIMDProcessor();
     
     // Reference tracking structures
@@ -1936,21 +1946,29 @@ class TurboSerial {
       const isFunction = this.readU8();
       
       if (isFunction) {
-        if (this.options.serializeFunctions) {
+        if (this.options.allowFunction && this.options.serializeFunctions) {
           const functionSource = this.readValue();
           const functionName = this.readValue();
           try {
-            // Attempt to reconstruct function
+            // Reconstruct function (requires allowFunction: true)
             obj[key] = new Function('return ' + functionSource)();
           } catch (e) {
             // Fall back to placeholder
             obj[key] = function() { throw new Error('Function deserialization failed'); };
           }
+        } else if (this.options.serializeFunctions) {
+          // serializeFunctions is true but allowFunction is false — read past the data but don't eval
+          const functionSource = this.readValue();
+          const functionName = this.readValue();
+          obj[key] = undefined;
         } else {
           // Check for placeholder
           const placeholderType = this.readU8();
           if (placeholderType === TYPE.FUNCTION_PLACEHOLDER) {
-            obj[key] = function() { throw new Error('Function not serialized'); };
+            // When allowFunction is false, store undefined instead of a function
+            obj[key] = this.options.allowFunction
+              ? function() { throw new Error('Function not serialized'); }
+              : undefined;
           }
         }
       } else {
@@ -2403,7 +2421,10 @@ class TurboSerial {
   readExtension(type) {
     switch (type) {
       case TYPE.FUNCTION_PLACEHOLDER:
-        return function() { throw new Error('Function not serialized'); };
+        // When allowFunction is false, return undefined instead of a function
+        return this.options.allowFunction
+          ? function() { throw new Error('Function not serialized'); }
+          : undefined;
       default:
         throw new Error(`Unknown extension type: 0x${type.toString(16)}`);
     }

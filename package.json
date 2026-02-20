@@ -1,6 +1,6 @@
 {
   "name": "@pixagram/turboserial",
-  "version": "0.0.5",
+  "version": "0.1.0",
   "description": "Ultra-optimized JavaScript serializer with comprehensive type support, SIMD optimization, and circular reference handling",
   "devDependencies": {
     "@babel/core": "^7.23.6",
@@ -31,7 +31,7 @@
     "alternative"
   ],
   "scripts": {
-    "build": "NODE_ENV=production webpack --node-env \"production\""
+    "build": "NODE_OPTIONS=--openssl-legacy-provider NODE_ENV=production webpack --node-env production"
   },
   "license": "MIT",
   "repository": {

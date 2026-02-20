@@ -1,4 +1,4 @@
-# TurboSerial V 0.0.5 - Ultra-Optimized JavaScript Serializer
+# TurboSerial V 0.1.0 - Ultra-Optimized JavaScript Serializer
 
 ![Logo](https://github.com/pixagram-blockchain/turboserial/blob/main/logo.jpg?raw=true)
 
@@ -18,6 +18,7 @@
 - **Typed Array Optimization**: Native support for all typed array types
 - **String Optimization**: ASCII/UTF-8 detection with size-based encoding
 - **Array Packing**: Automatic optimization for numeric arrays
+- **Secure by Default**: No `eval()` or `new Function()` calls unless explicitly opted in
 - **Zero Dependencies**: Lightweight, self-contained library
 
 ## 📦 Installation
@@ -59,9 +60,40 @@ const serializer = new TurboSerial({
   shareArrayBuffers: true,      // Share ArrayBuffer references
   simdOptimization: true,       // Enable SIMD optimizations
   detectCircular: true,         // Detect circular references
-  memoryPoolSize: 65536        // Initial memory pool size
+  allowFunction: false,         // Allow function storage/retrieval (security gate)
+  serializeFunctions: false,    // Capture and reconstruct function source
+  preservePropertyDescriptors: true, // Preserve property descriptors
+  memoryPoolSize: 65536         // Initial memory pool size
 });
 ```
+
+### Function Handling
+
+By default, TurboSerial never calls `eval()` or `new Function()`. Function-valued properties are silently omitted during serialization and return as `undefined` on deserialization. This is controlled by the `allowFunction` option which acts as a security gate.
+
+```javascript
+// Default — safe, no eval() ever
+const safe = new TurboSerial();
+
+// Functions exist as throwing placeholders, but still no eval()
+const withPlaceholders = new TurboSerial({
+  allowFunction: true
+});
+
+// Full round-trip — function source is captured and reconstructed via new Function()
+const withFunctions = new TurboSerial({
+  allowFunction: true,
+  serializeFunctions: true
+});
+```
+
+| `allowFunction` | `serializeFunctions` | Behavior |
+|---|---|---|
+| `false` (default) | *(forced false)* | Functions ignored entirely. No `eval()`. Properties become `undefined`. |
+| `true` | `false` | Functions stored as **placeholders** that throw when called. No `eval()`. |
+| `true` | `true` | Full round-trip. Function source captured and reconstructed via `new Function()`. |
+
+> ⚠️ **Security Note**: Only enable `allowFunction: true` with `serializeFunctions: true` when you fully trust the serialized data. Reconstructing functions from arbitrary source strings via `new Function()` can execute arbitrary code.
 
 ### Circular References
 
@@ -120,14 +152,15 @@ TurboSerial is designed to be one of the fastest JavaScript serializers availabl
 - `number` (int8, int16, int32, uint32, float32, float64, NaN, ±Infinity, -0)
 - `bigint` (small and large values)
 - `string` (ASCII/UTF-8 optimized)
-- `symbol` (local and global)
+- `symbol` (local, global, and well-known)
 
 ### Complex Types
 - `Array` (dense, sparse, packed numeric)
-- `Object` (plain, constructor, empty)
+- `Object` (plain, literal, constructor, with descriptors, with methods)
 - `Date` (valid and invalid)
 - `RegExp` (all patterns and flags)
 - `Error` (all standard error types + AggregateError)
+- `Function` (opt-in via `allowFunction` + `serializeFunctions`)
 
 ### Binary Types
 - `ArrayBuffer`, `SharedArrayBuffer`
@@ -144,6 +177,7 @@ TurboSerial is designed to be one of the fastest JavaScript serializers availabl
 - Object deduplication
 - ArrayBuffer sharing
 - SIMD-optimized packed arrays
+- Property descriptor preservation
 
 ## 🏗️ Architecture
 
@@ -175,12 +209,15 @@ TurboSerial employs several advanced techniques for optimal performance:
 
 ```javascript
 new TurboSerial({
-  compression: boolean,        // Enable compression (default: false)
-  deduplication: boolean,      // Enable object deduplication (default: true)
-  shareArrayBuffers: boolean,  // Share ArrayBuffer references (default: true)
-  simdOptimization: boolean,   // Enable SIMD optimizations (default: true)
-  detectCircular: boolean,     // Detect circular references (default: true)
-  memoryPoolSize: number      // Initial memory pool size (default: 65536)
+  compression: boolean,              // Enable compression (default: false)
+  deduplication: boolean,            // Enable object deduplication (default: true)
+  shareArrayBuffers: boolean,        // Share ArrayBuffer references (default: true)
+  simdOptimization: boolean,         // Enable SIMD optimizations (default: true)
+  detectCircular: boolean,           // Detect circular references (default: true)
+  allowFunction: boolean,            // Allow function storage/retrieval (default: false)
+  serializeFunctions: boolean,       // Capture and reconstruct function source (default: false)
+  preservePropertyDescriptors: boolean, // Preserve property descriptors (default: true)
+  memoryPoolSize: number             // Initial memory pool size (default: 65536)
 })
 ```
 
@@ -191,6 +228,12 @@ Serializes a JavaScript value to a binary format.
 
 #### `deserialize(buffer: ArrayBuffer | Uint8Array): any`
 Deserializes binary data back to a JavaScript value.
+
+## 🔒 Security
+
+TurboSerial is **secure by default**. The `allowFunction` option defaults to `false`, which guarantees that no calls to `eval()` or `new Function()` are ever made during serialization or deserialization. Function-valued properties are silently omitted and deserialized as `undefined`.
+
+To enable function serialization, you must explicitly opt in by setting both `allowFunction: true` and `serializeFunctions: true`. Only do this when you fully trust the source of the serialized data, as reconstructing functions from stored source strings can execute arbitrary code.
 
 ## 🤝 Contributing
 
