@@ -1,9 +1,10 @@
 {
   "name": "@pixagram/turboserial",
-  "version": "0.3.0",
+  "version": "0.3.2",
   "description": "Ultra-optimized JavaScript serializer with comprehensive type support, SIMD optimization, and circular reference handling",
   "devDependencies": {
     "@babel/core": "^7.23.6",
+    "@babel/plugin-transform-optional-chaining": "^7.28.6",
     "@babel/preset-env": "^7.23.6",
     "babel-loader": "~8.3.0",
     "path": "~0.12.7",
@@ -11,11 +12,9 @@
     "webpack": "~4.37.0",
     "webpack-cli": "~4.10.0"
   },
-  "dependencies": {
-  },
   "build": {},
   "author": "Affolter Matias",
-"keywords": [
+  "keywords": [
     "serialization",
     "serializer",
     "binary",

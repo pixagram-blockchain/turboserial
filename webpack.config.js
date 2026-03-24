@@ -28,9 +28,12 @@ module.exports = {
                         "presets": [
                             ["@babel/preset-env", {
                                 "targets": {
-                                    "chrome": "63"
+                                    "chrome": "100"
                                 }
                             }]
+                        ],
+                        "plugins": [
+                            "@babel/plugin-transform-optional-chaining"
                         ]
                     }
                 }

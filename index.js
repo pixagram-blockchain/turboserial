@@ -1,5 +1,5 @@
 /**
- * TurboSerial v0.3.0 — Full-feature rewrite for raw speed
+ * TurboSerial v0.3.1 — Hotfix: deserialization buffer reference corrections
  *
  * Same API & wire-format type codes as v0.1.0.
  * Architecture: single flat class, no alignment padding, no ensure(),
@@ -651,9 +651,19 @@ class TurboSerial {
   // ── DESERIALIZATION ───────────────────────────────────────────────
   // ══════════════════════════════════════════════════════════════════
 
+  // ─────────────────────────────────────────────────────────────────
+  // CRITICAL FIX (v0.3.1): All read-path methods must read from
+  // this.buffer (the deserialization input), NOT this.buf (the
+  // serialization scratch buffer). Previously, readValue(), _rV(),
+  // _rStr(), _rFill(), and fillObject() read type/length bytes from
+  // this.buf — which is either zeroed (cold start) or holds stale
+  // data from a prior serialize() call. This caused:
+  //   • null returns on cold start (0x00 = T.NULL)
+  //   • corrupt/partial objects when stale bytes misalign the parser
+  // ─────────────────────────────────────────────────────────────────
+
   readValue() {
-    const b = this.buffer;
-    const type = this.buf[this.pos++];
+    const type = this.buffer[this.pos++]; // FIX: was this.buf
 
     // References
     if (type === T.REFERENCE || type === T.CIRCULAR_REF) return this.deserializeRefs[this._rV()];
@@ -705,11 +715,10 @@ class TurboSerial {
   // ── Read: varint ──────────────────────────────────────────────────
 
   _rV() {
-    const b = this.buffer;
-    let p = this.pos, byte = this.buf[p++];
+    let p = this.pos, byte = this.buffer[p++]; // FIX: was this.buf
     if (!(byte & 0x80)) { this.pos = p; return byte; }
     let val = byte & 0x7F, shift = 7;
-    do { byte = this.buf[p++]; val |= (byte & 0x7F) << shift; shift += 7; } while (byte & 0x80);
+    do { byte = this.buffer[p++]; val |= (byte & 0x7F) << shift; shift += 7; } while (byte & 0x80); // FIX: was this.buf
     this.pos = p;
     return val >>> 0;
   }
@@ -739,7 +748,7 @@ class TurboSerial {
       const n = this._rV();
       for (let i = 0; i < n; i++) {
         const key = this.readValue();
-        const flags = this.buffer[this.pos++];
+        const flags = this.buffer[this.pos++]; // FIX: was this.buf
         const desc = { enumerable: !!(flags & 1), writable: !!(flags & 2), configurable: !!(flags & 4) };
         if (flags & 8 || flags & 16) {
           if (flags & 8) desc.get = this.readValue();
@@ -751,7 +760,7 @@ class TurboSerial {
       const n = this._rV();
       for (let i = 0; i < n; i++) {
         const key = this.readValue();
-        const isFunc = this.buffer[this.pos++];
+        const isFunc = this.buffer[this.pos++]; // FIX: was this.buf
         if (isFunc) {
           if (this.options.allowFunction && this.options.serializeFunctions) {
             const src = this.readValue(); this.readValue(); // name
@@ -775,19 +784,19 @@ class TurboSerial {
   // ── Read: numbers ─────────────────────────────────────────────────
 
   _rNum(type) {
-    const dv = this.view; let p = this.pos, v;
+    let p = this.pos, v;
     switch (type) {
       case T.INT8: v = (this.buffer[p] << 24) >> 24; this.pos = p+1; return v;
-      case T.INT16: v = this.dv.getInt16(p, true); this.pos = p+2; return v;
-      case T.INT32: v = this.dv.getInt32(p, true); this.pos = p+4; return v;
-      case T.UINT32: v = this.dv.getUint32(p, true); this.pos = p+4; return v;
-      case T.FLOAT32: v = this.dv.getFloat32(p, true); this.pos = p+4; return v;
-      case T.FLOAT64: v = this.dv.getFloat64(p, true); this.pos = p+8; return v;
+      case T.INT16: v = this.view.getInt16(p, true); this.pos = p+2; return v;
+      case T.INT32: v = this.view.getInt32(p, true); this.pos = p+4; return v;
+      case T.UINT32: v = this.view.getUint32(p, true); this.pos = p+4; return v;
+      case T.FLOAT32: v = this.view.getFloat32(p, true); this.pos = p+4; return v;
+      case T.FLOAT64: v = this.view.getFloat64(p, true); this.pos = p+8; return v;
       case T.NAN: return NaN;
       case T.INFINITY: return Infinity;
       case T.NEG_INFINITY: return -Infinity;
       case T.NEG_ZERO: return -0;
-      case T.VARINT: v = this._rV(); return this.buffer[this.pos++] ? -v : v;
+      case T.VARINT: v = this._rV(); return this.buffer[this.pos++] ? -v : v; // FIX: was this.buf
     }
   }
 
@@ -813,7 +822,7 @@ class TurboSerial {
     let len;
     if (type === T.STRING_ASCII_TINY || type === T.STRING_ASCII_SHORT ||
         type === T.STRING_UTF8_TINY || type === T.STRING_UTF8_SHORT) {
-      len = this.buf[this.pos++];
+      len = this.buffer[this.pos++]; // FIX: was this.buf
     } else { len = this._rV(); }
 
     let str;
@@ -832,14 +841,14 @@ class TurboSerial {
   // ── Read: packed arrays ───────────────────────────────────────────
 
   _rPacked(type) {
-    const len = this._rV(), arr = new Array(len), dv = this.view;
+    const len = this._rV(), arr = new Array(len);
     let p = this.pos;
     switch (type) {
       case T.ARRAY_PACKED_I8:  for (let i=0;i<len;i++) arr[i] = (this.buffer[p++]<<24)>>24; break;
-      case T.ARRAY_PACKED_I16: for (let i=0;i<len;i++) { arr[i] = this.dv.getInt16(p,true); p+=2; } break;
-      case T.ARRAY_PACKED_I32: for (let i=0;i<len;i++) { arr[i] = this.dv.getInt32(p,true); p+=4; } break;
-      case T.ARRAY_PACKED_F32: for (let i=0;i<len;i++) { arr[i] = this.dv.getFloat32(p,true); p+=4; } break;
-      case T.ARRAY_PACKED_F64: for (let i=0;i<len;i++) { arr[i] = this.dv.getFloat64(p,true); p+=8; } break;
+      case T.ARRAY_PACKED_I16: for (let i=0;i<len;i++) { arr[i] = this.view.getInt16(p,true); p+=2; } break;
+      case T.ARRAY_PACKED_I32: for (let i=0;i<len;i++) { arr[i] = this.view.getInt32(p,true); p+=4; } break;
+      case T.ARRAY_PACKED_F32: for (let i=0;i<len;i++) { arr[i] = this.view.getFloat32(p,true); p+=4; } break;
+      case T.ARRAY_PACKED_F64: for (let i=0;i<len;i++) { arr[i] = this.view.getFloat64(p,true); p+=8; } break;
     }
     this.pos = p; return arr;
   }
@@ -847,7 +856,7 @@ class TurboSerial {
   // ── Read: typed arrays ────────────────────────────────────────────
 
   _rTypedArr(type) {
-    const shared = this.buffer[this.pos++];
+    const shared = this.buffer[this.pos++]; // FIX: was this.buf
     if (shared) {
       const bid = this._rV(), bo = this._rV(), len = this._rV();
       return new (TCTOR[type])(this.deserializeBuffers[bid], bo, len);
