@@ -178,77 +178,183 @@ const WELLKNOWN_SYMBOLS_BY_NAME = new Map();
 })();
 
 /**
- * Ultra-optimized memory pool with cache-line alignment
+ * Ultra-optimized memory pool with asm.js-style heap architecture
+ * Uses Int32Array control heap for JIT-friendly position tracking,
+ * getter/setter property accessors for hot-path memory performance,
+ * and cache-line aligned allocation strategy.
  */
 class UltraMemoryPool {
   /**
-   * Initialize memory pool with optimal alignment
+   * Initialize memory pool with asm.js-style heap
    * @param {number} initialSize - Initial buffer size
    */
   constructor(initialSize = 65536) {
-    // Align to cache line
-    this.size = ((initialSize + CACHE_LINE_SIZE - 1) & ~(CACHE_LINE_SIZE - 1)) >>> 0;
-    this.buffer = new ArrayBuffer(this.size);
+    // asm.js-style control heap: [pos, size, generation, peakPos]
+    // Using Int32Array for JIT-optimized integer access
+    this._heap = new Int32Array(4);
     
-    // Create aligned views - fixed offset calculation
-    this.offset = 0;
+    // Align to cache line
+    const alignedSize = ((initialSize + CACHE_LINE_SIZE - 1) & ~(CACHE_LINE_SIZE - 1)) >>> 0;
+    this._heap[1] = alignedSize; // size
+    this._heap[2] = 0;          // generation (tracks reallocation)
+    this._heap[3] = 0;          // peakPos (high-water mark)
+    
+    this.buffer = new ArrayBuffer(alignedSize);
     this.u8 = new Uint8Array(this.buffer);
     this.view = new DataView(this.buffer);
-    this.pos = 0;
     
-    // Pre-allocate typed views for common operations
-    this.f32View = null;
-    this.f64View = null;
-    this.i32View = null;
+    // Lazy-initialized typed view cache (invalidated on realloc via generation)
+    this._viewCache = { gen: -1, f32: null, f64: null, i32: null, u32: null };
+  }
+
+  /**
+   * Position getter — reads from asm.js-style heap
+   * JIT engines optimize typed array element access to near-register speed
+   * @returns {number} Current write position
+   */
+  get pos() {
+    return this._heap[0]|0;
+  }
+
+  /**
+   * Position setter — writes to asm.js-style heap with coercion
+   * @param {number} v - New write position
+   */
+  set pos(v) {
+    this._heap[0] = v|0;
+  }
+
+  /**
+   * Size getter — reads from heap
+   * @returns {number} Current buffer capacity
+   */
+  get size() {
+    return this._heap[1]|0;
+  }
+
+  /**
+   * Size setter — writes to heap
+   * @param {number} v - New buffer capacity
+   */
+  set size(v) {
+    this._heap[1] = v|0;
+  }
+
+  /**
+   * Lazy Float32Array view — created on first access, cached until realloc
+   * @returns {Float32Array|null} Aligned view or null if unaligned buffer
+   */
+  get f32View() {
+    const gen = this._heap[2]|0;
+    if (this._viewCache.gen !== gen) this._invalidateViewCache(gen);
+    if (!this._viewCache.f32) {
+      try { this._viewCache.f32 = new Float32Array(this.buffer); } catch(e) { return null; }
+    }
+    return this._viewCache.f32;
+  }
+
+  /**
+   * Lazy Float64Array view
+   * @returns {Float64Array|null}
+   */
+  get f64View() {
+    const gen = this._heap[2]|0;
+    if (this._viewCache.gen !== gen) this._invalidateViewCache(gen);
+    if (!this._viewCache.f64) {
+      try { this._viewCache.f64 = new Float64Array(this.buffer); } catch(e) { return null; }
+    }
+    return this._viewCache.f64;
+  }
+
+  /**
+   * Lazy Int32Array view
+   * @returns {Int32Array|null}
+   */
+  get i32View() {
+    const gen = this._heap[2]|0;
+    if (this._viewCache.gen !== gen) this._invalidateViewCache(gen);
+    if (!this._viewCache.i32) {
+      try { this._viewCache.i32 = new Int32Array(this.buffer); } catch(e) { return null; }
+    }
+    return this._viewCache.i32;
+  }
+
+  /**
+   * Lazy Uint32Array view
+   * @returns {Uint32Array|null}
+   */
+  get u32View() {
+    const gen = this._heap[2]|0;
+    if (this._viewCache.gen !== gen) this._invalidateViewCache(gen);
+    if (!this._viewCache.u32) {
+      try { this._viewCache.u32 = new Uint32Array(this.buffer); } catch(e) { return null; }
+    }
+    return this._viewCache.u32;
+  }
+
+  /**
+   * Invalidate all cached typed views (called on realloc)
+   * @param {number} gen - New generation counter
+   */
+  _invalidateViewCache(gen) {
+    this._viewCache.gen = gen|0;
+    this._viewCache.f32 = null;
+    this._viewCache.f64 = null;
+    this._viewCache.i32 = null;
+    this._viewCache.u32 = null;
   }
 
   /**
    * Ensure capacity with efficient reallocation
+   * Uses asm.js-style coerced arithmetic throughout
    * @param {number} bytes - Required bytes
    */
   ensure(bytes) {
     bytes = bytes|0;
-    const required = (this.pos + bytes)|0;
+    const pos = this._heap[0]|0;
+    const size = this._heap[1]|0;
+    const required = (pos + bytes)|0;
     
-    if (required > this.size) {
+    if ((required|0) > (size|0)) {
       // Double size or accommodate requirement
-      const newSize = Math.max(this.size << 1, required + CACHE_LINE_SIZE)|0;
+      const doubled = size << 1;
+      const minRequired = (required + CACHE_LINE_SIZE)|0;
+      const newSize = (doubled > minRequired) ? doubled : minRequired;
       const alignedSize = ((newSize + CACHE_LINE_SIZE - 1) & ~(CACHE_LINE_SIZE - 1)) >>> 0;
       
       const newBuffer = new ArrayBuffer(alignedSize);
       const newU8 = new Uint8Array(newBuffer);
       
-      // Use subarray for efficient copy
-      newU8.set(this.u8.subarray(0, this.pos));
+      // Bulk copy via subarray — avoids per-element overhead
+      newU8.set(this.u8.subarray(0, pos));
       
       this.buffer = newBuffer;
       this.u8 = newU8;
       this.view = new DataView(newBuffer);
-      this.size = alignedSize;
+      this._heap[1] = alignedSize;
       
-      // Reset cached views
-      this.f32View = null;
-      this.f64View = null;
-      this.i32View = null;
+      // Bump generation to invalidate cached typed views
+      this._heap[2] = (this._heap[2] + 1)|0;
     }
   }
 
   /**
-   * Align position for optimal memory access
-   * @param {number} alignment - Required alignment
+   * Align position for optimal SIMD-style memory access
+   * Uses branchless bitmask alignment
+   * @param {number} alignment - Required alignment (must be power of 2)
    */
   alignPos(alignment) {
     const mask = (alignment - 1)|0;
-    this.pos = ((this.pos + mask) & ~mask) >>> 0;
+    this._heap[0] = ((this._heap[0] + mask) & ~mask) >>> 0;
   }
 
   /**
-   * Write unsigned 8-bit integer
+   * Write unsigned 8-bit integer — inlined hot path
    * @param {number} value - Value to write
    */
   writeU8(value) {
     this.ensure(1);
-    this.u8[this.pos++] = value & 0xFF;
+    this.u8[this._heap[0]++] = value & 0xFF;
   }
 
   /**
@@ -258,8 +364,9 @@ class UltraMemoryPool {
   writeU16(value) {
     this.alignPos(2);
     this.ensure(2);
-    this.view.setUint16(this.pos, value & 0xFFFF, true);
-    this.pos = (this.pos + 2)|0;
+    const p = this._heap[0]|0;
+    this.view.setUint16(p, value & 0xFFFF, true);
+    this._heap[0] = (p + 2)|0;
   }
 
   /**
@@ -269,8 +376,9 @@ class UltraMemoryPool {
   writeI16(value) {
     this.alignPos(2);
     this.ensure(2);
-    this.view.setInt16(this.pos, value, true);
-    this.pos = (this.pos + 2)|0;
+    const p = this._heap[0]|0;
+    this.view.setInt16(p, value|0, true);
+    this._heap[0] = (p + 2)|0;
   }
 
   /**
@@ -280,8 +388,9 @@ class UltraMemoryPool {
   writeU32(value) {
     this.alignPos(4);
     this.ensure(4);
-    this.view.setUint32(this.pos, value >>> 0, true);
-    this.pos = (this.pos + 4)|0;
+    const p = this._heap[0]|0;
+    this.view.setUint32(p, value >>> 0, true);
+    this._heap[0] = (p + 4)|0;
   }
 
   /**
@@ -291,8 +400,9 @@ class UltraMemoryPool {
   writeI32(value) {
     this.alignPos(4);
     this.ensure(4);
-    this.view.setInt32(this.pos, value|0, true);
-    this.pos = (this.pos + 4)|0;
+    const p = this._heap[0]|0;
+    this.view.setInt32(p, value|0, true);
+    this._heap[0] = (p + 4)|0;
   }
 
   /**
@@ -302,8 +412,9 @@ class UltraMemoryPool {
   writeF32(value) {
     this.alignPos(4);
     this.ensure(4);
-    this.view.setFloat32(this.pos, +value, true);
-    this.pos = (this.pos + 4)|0;
+    const p = this._heap[0]|0;
+    this.view.setFloat32(p, +value, true);
+    this._heap[0] = (p + 4)|0;
   }
 
   /**
@@ -313,8 +424,9 @@ class UltraMemoryPool {
   writeF64(value) {
     this.alignPos(8);
     this.ensure(8);
-    this.view.setFloat64(this.pos, +value, true);
-    this.pos = (this.pos + 8)|0;
+    const p = this._heap[0]|0;
+    this.view.setFloat64(p, +value, true);
+    this._heap[0] = (p + 8)|0;
   }
 
   /**
@@ -324,8 +436,9 @@ class UltraMemoryPool {
   writeBigInt64(value) {
     this.alignPos(8);
     this.ensure(8);
-    this.view.setBigInt64(this.pos, BigInt(value), true);
-    this.pos = (this.pos + 8)|0;
+    const p = this._heap[0]|0;
+    this.view.setBigInt64(p, BigInt(value), true);
+    this._heap[0] = (p + 8)|0;
   }
 
   /**
@@ -336,28 +449,29 @@ class UltraMemoryPool {
     value = value >>> 0;
     this.ensure(5);
     
-    // Optimized small value path
+    // Optimized small value path — single byte, no loop
     if (value < 0x80) {
-      this.u8[this.pos++] = value;
+      this.u8[this._heap[0]++] = value;
       return;
     }
     
-    // Optimized medium value path
+    // Optimized medium value path — 2 bytes, no loop
     if (value < 0x4000) {
-      this.u8[this.pos] = (value & 0x7F) | 0x80;
-      this.u8[this.pos + 1] = value >>> 7;
-      this.pos = (this.pos + 2)|0;
+      const p = this._heap[0]|0;
+      this.u8[p] = (value & 0x7F) | 0x80;
+      this.u8[p + 1] = value >>> 7;
+      this._heap[0] = (p + 2)|0;
       return;
     }
     
-    // General case with unrolled loop
-    let pos = this.pos;
+    // General case with direct heap access
+    let p = this._heap[0]|0;
     do {
-      this.u8[pos++] = (value & 0x7F) | 0x80;
+      this.u8[p++] = (value & 0x7F) | 0x80;
       value >>>= 7;
     } while (value >= 0x80);
-    this.u8[pos++] = value;
-    this.pos = pos;
+    this.u8[p++] = value;
+    this._heap[0] = p;
   }
 
   /**
@@ -377,36 +491,41 @@ class UltraMemoryPool {
     this.alignPos(Math.min(elementSize, 8));
     this.ensure(len * elementSize);
     
-    // Use typed array views for efficient bulk writes
+    // Use typed array views for SIMD-style bulk writes
     switch (elementType) {
       case TYPE.ARRAY_PACKED_I8: {
-        const view = new Int8Array(this.buffer, this.pos, len);
+        const p = this._heap[0]|0;
+        const view = new Int8Array(this.buffer, p, len);
         view.set(array);
-        this.pos = (this.pos + len)|0;
+        this._heap[0] = (p + len)|0;
         break;
       }
       case TYPE.ARRAY_PACKED_I16: {
-        const view = new Int16Array(this.buffer, this.pos, len);
+        const p = this._heap[0]|0;
+        const view = new Int16Array(this.buffer, p, len);
         for (let i = 0; i < len; i++) view[i] = array[i]|0;
-        this.pos = (this.pos + (len << 1))|0;
+        this._heap[0] = (p + (len << 1))|0;
         break;
       }
       case TYPE.ARRAY_PACKED_I32: {
-        const view = new Int32Array(this.buffer, this.pos, len);
+        const p = this._heap[0]|0;
+        const view = new Int32Array(this.buffer, p, len);
         for (let i = 0; i < len; i++) view[i] = array[i]|0;
-        this.pos = (this.pos + (len << 2))|0;
+        this._heap[0] = (p + (len << 2))|0;
         break;
       }
       case TYPE.ARRAY_PACKED_F32: {
-        const view = new Float32Array(this.buffer, this.pos, len);
+        const p = this._heap[0]|0;
+        const view = new Float32Array(this.buffer, p, len);
         for (let i = 0; i < len; i++) view[i] = +array[i];
-        this.pos = (this.pos + (len << 2))|0;
+        this._heap[0] = (p + (len << 2))|0;
         break;
       }
       case TYPE.ARRAY_PACKED_F64: {
-        const view = new Float64Array(this.buffer, this.pos, len);
+        const p = this._heap[0]|0;
+        const view = new Float64Array(this.buffer, p, len);
         for (let i = 0; i < len; i++) view[i] = +array[i];
-        this.pos = (this.pos + (len << 3))|0;
+        this._heap[0] = (p + (len << 3))|0;
         break;
       }
       default:
@@ -423,98 +542,183 @@ class UltraMemoryPool {
     const alignment = Math.min(elementSize, SIMD_ALIGNMENT);
     this.alignPos(alignment);
     
-    const totalBytes = data.byteLength || data.length;
+    const totalBytes = (data.byteLength || data.length)|0;
     this.ensure(totalBytes);
     
+    const p = this._heap[0]|0;
     // Use subarray for efficient copy
     if (data.buffer && data.byteOffset !== undefined) {
       const sourceBytes = new Uint8Array(data.buffer, data.byteOffset, totalBytes);
-      this.u8.set(sourceBytes, this.pos);
+      this.u8.set(sourceBytes, p);
     } else {
-      this.u8.set(data, this.pos);
+      this.u8.set(data, p);
     }
     
-    this.pos = (this.pos + totalBytes)|0;
+    this._heap[0] = (p + totalBytes)|0;
   }
 
   /**
-   * Reset pool position
+   * Reset pool position (fast path for serialize cycles)
+   * Snapshots high-water mark before resetting for shrink intelligence
    */
   reset() {
-    this.pos = 0;
+    // Snapshot peak before resetting
+    const pos = this._heap[0]|0;
+    const peak = this._heap[3]|0;
+    this._heap[3] = (pos > peak) ? pos : peak;
+    this._heap[0] = 0;
   }
 
   /**
-   * Get result buffer
-   * @returns {Uint8Array} Result buffer
+   * Full memory reset — zeros the used region, resets all heap counters,
+   * invalidates typed view caches, and optionally shrinks the buffer.
+   * Call between independent serialize batches to reclaim GC pressure
+   * and prevent stale data leakage between operations.
+   * 
+   * @param {Object} [opts] - Reset options
+   * @param {boolean} [opts.shrink=false] - Shrink buffer to initial size if oversized
+   * @param {number} [opts.initialSize=65536] - Target size when shrinking
+   * @param {boolean} [opts.zero=true] - Zero the buffer memory (security/GC)
+   */
+  resetMemory(opts = {}) {
+    const shrink = opts.shrink || false;
+    const initialSize = opts.initialSize || 65536;
+    const zero = opts.zero !== false;
+    
+    // Finalize peak measurement
+    const pos = this._heap[0]|0;
+    const storedPeak = this._heap[3]|0;
+    const peak = (pos > storedPeak) ? pos : storedPeak;
+    const currentSize = this._heap[1]|0;
+    
+    // Optionally shrink oversized buffers (>4x initial and peak usage <50% of current)
+    const alignedInitial = ((initialSize + CACHE_LINE_SIZE - 1) & ~(CACHE_LINE_SIZE - 1)) >>> 0;
+    if (shrink && currentSize > (alignedInitial << 2) && peak < (currentSize >>> 1)) {
+      // Reallocate to a smaller aligned buffer
+      const newSize = Math.max(alignedInitial, ((peak << 1) + CACHE_LINE_SIZE - 1) & ~(CACHE_LINE_SIZE - 1)) >>> 0;
+      this.buffer = new ArrayBuffer(newSize);
+      this.u8 = new Uint8Array(this.buffer);
+      this.view = new DataView(this.buffer);
+      this._heap[1] = newSize;
+      // Bump generation for view cache invalidation
+      this._heap[2] = (this._heap[2] + 1)|0;
+    } else if (zero && peak > 0) {
+      // Zero only the used region — avoids O(n) on the whole buffer
+      this.u8.fill(0, 0, peak);
+    }
+    
+    // Reset all heap counters
+    this._heap[0] = 0; // pos
+    this._heap[3] = 0; // peakPos
+    
+    // Force view cache invalidation
+    this._invalidateViewCache(this._heap[2]|0);
+  }
+
+  /**
+   * Get result buffer as subarray view (zero-copy)
+   * Also snapshots peak position for shrink intelligence
+   * @returns {Uint8Array} Result buffer slice
    */
   getResult() {
-    return this.u8.subarray(0, this.pos);
+    const pos = this._heap[0]|0;
+    // Snapshot peak
+    const peak = this._heap[3]|0;
+    this._heap[3] = (pos > peak) ? pos : peak;
+    return this.u8.subarray(0, pos);
   }
 }
 
 /**
  * SIMD-style processor for vectorized operations
+ * Uses asm.js coercion patterns for JIT-optimized numeric analysis
  */
 class SIMDProcessor {
   constructor() {
-    this.blockSize = SIMD_BLOCK_SIZE;
+    this.blockSize = SIMD_BLOCK_SIZE|0;
+    // Pre-allocated scratch buffer for float32 precision checks (avoids per-call alloc)
+    this._f32Scratch = new Float32Array(1);
   }
 
   /**
    * Check if array can be optimized with SIMD-style processing
+   * Uses branchless bitwise checks for fast rejection
    * @param {Array} array - Array to check
    * @returns {boolean} True if optimizable
    */
   canOptimize(array) {
-    const len = array.length;
+    const len = array.length|0;
     
-    // Use bit manipulation for size check
-    const isGoodSize = (len >= 8) & ((len & (len - 1)) == 0 || len >= 16);
+    // Branchless size check: >= 8 AND (power-of-2 OR >= 16)
+    const isGoodSize = ((len >= 8) & ((len & (len - 1)) == 0 | len >= 16))|0;
     if (!isGoodSize) return false;
     
     // Fast type check
-    const firstType = typeof array[0];
-    if (firstType !== 'number') return false;
+    if (typeof array[0] !== 'number') return false;
     
-    // Sample-based homogeneity check
-    const sampleInterval = Math.max(1, (len >>> 5)|0);
-    for (let i = sampleInterval; i < len; i += sampleInterval) {
-      if (typeof array[i] !== firstType) return false;
+    // Sample-based homogeneity check with coerced interval
+    const sampleInterval = Math.max(1, (len >>> 5)|0)|0;
+    for (let i = sampleInterval|0; (i|0) < (len|0); i = (i + sampleInterval)|0) {
+      if (typeof array[i] !== 'number') return false;
     }
     
     return true;
   }
 
   /**
-   * Analyze numeric array for optimal packing
+   * Analyze numeric array for optimal packing using SIMD-lane-style block processing
+   * Processes 4 elements per iteration (simulating 128-bit SIMD lanes)
    * @param {Array} array - Array to analyze
    * @returns {Object} Analysis result with type and element size
    */
   analyzeNumericArray(array) {
     let isInteger = 1;
-    let min = Infinity;
+    let min = +Infinity;
     let max = -Infinity;
     let canBeFloat32 = 1;
     
-    const len = array.length;
+    const len = array.length|0;
+    const f32 = this._f32Scratch;
     
-    // Process in blocks for better performance
-    for (let i = 0; i < len; i++) {
-      const val = array[i];
+    // Process in 4-wide SIMD-style lanes for better ILP
+    const blockEnd = (len & ~3)|0; // len rounded down to multiple of 4
+    
+    for (let i = 0; (i|0) < (blockEnd|0); i = (i + 4)|0) {
+      const v0 = +array[i];
+      const v1 = +array[i + 1];
+      const v2 = +array[i + 2];
+      const v3 = +array[i + 3];
       
-      // Branchless operations
+      // Integer check — 4 lanes
+      isInteger &= +((v0|0) == v0) & +((v1|0) == v1) & +((v2|0) == v2) & +((v3|0) == v3);
+      
+      // Min/max reduction — 2-level pairwise
+      const lo = v0 < v1 ? v0 : v1;
+      const hi = v0 > v1 ? v0 : v1;
+      const lo2 = v2 < v3 ? v2 : v3;
+      const hi2 = v2 > v3 ? v2 : v3;
+      min = (lo < lo2 ? lo : lo2) < min ? (lo < lo2 ? lo : lo2) : min;
+      max = (hi > hi2 ? hi : hi2) > max ? (hi > hi2 ? hi : hi2) : max;
+      
+      // Float32 precision check — 4 lanes
+      if (canBeFloat32) {
+        f32[0] = v0; canBeFloat32 &= +(f32[0] == v0);
+        f32[0] = v1; canBeFloat32 &= +(f32[0] == v1);
+        f32[0] = v2; canBeFloat32 &= +(f32[0] == v2);
+        f32[0] = v3; canBeFloat32 &= +(f32[0] == v3);
+      }
+    }
+    
+    // Scalar tail
+    for (let i = blockEnd|0; (i|0) < (len|0); i = (i + 1)|0) {
+      const val = +array[i];
       const intVal = val|0;
       isInteger &= +(val == intVal);
-      
-      // Use Math.min/max for branchless comparison
-      min = Math.min(min, val);
-      max = Math.max(max, val);
-      
-      // Check float32 precision
+      min = val < min ? val : min;
+      max = val > max ? val : max;
       if (canBeFloat32) {
-        const f32Val = Math.fround(val);
-        canBeFloat32 &= +(f32Val == val);
+        f32[0] = val;
+        canBeFloat32 &= +(f32[0] == val);
       }
     }
     
@@ -550,6 +754,14 @@ class UltraTypeDetector {
   constructor(options = {}) {
     this.simdProcessor = new SIMDProcessor();
     this.allowFunction = options.allowFunction || false;
+    this.preserveDescriptors = options.preservePropertyDescriptors !== false;
+    
+    // Pre-allocated scratch buffers for detectNumber — avoids per-call allocation
+    this._numF64 = new Float64Array(1);
+    this._numU32 = new Uint32Array(this._numF64.buffer);
+    
+    // Shared TextEncoder for detectString — avoids per-call allocation
+    this._encoder = new TextEncoder();
     
     // Pre-computed maps for O(1) lookups
     this.constructorMap = new Map();
@@ -653,14 +865,13 @@ class UltraTypeDetector {
     // Fast NaN check
     if (value !== value) return TYPE.NAN;
     
-    // Fast infinity checks using bit manipulation
-    const bits = new Float64Array([value]);
-    const intView = new Uint32Array(bits.buffer);
-    const highBits = intView[1];
+    // Use pre-allocated scratch buffers — zero allocation
+    this._numF64[0] = value;
+    const highBits = this._numU32[1];
     
     // Check for infinity: exponent all 1s, mantissa 0
     const expMask = 0x7FF00000;
-    const isInfinity = ((highBits & expMask) == expMask) & ((intView[0] == 0) & ((highBits & 0xFFFFF) == 0));
+    const isInfinity = ((highBits & expMask) == expMask) & ((this._numU32[0] == 0) & ((highBits & 0xFFFFF) == 0));
     
     if (isInfinity) {
       return (highBits >>> 31) ? TYPE.NEG_INFINITY : TYPE.INFINITY;
@@ -728,7 +939,7 @@ class UltraTypeDetector {
              (len < 256) ? TYPE.STRING_ASCII_SHORT :
              TYPE.STRING_ASCII_LONG;
     } else {
-      const byteLength = new TextEncoder().encode(value).length;
+      const byteLength = this._encoder.encode(value).length;
       return (byteLength < 16) ? TYPE.STRING_UTF8_TINY :
              (byteLength < 256) ? TYPE.STRING_UTF8_SHORT :
              TYPE.STRING_UTF8_LONG;
@@ -817,6 +1028,13 @@ class UltraTypeDetector {
     
     if (!isPlainObject) {
       return TYPE.OBJECT_CONSTRUCTOR;
+    }
+    
+    // Fast path: skip descriptor analysis when not preserving them
+    if (!this.preserveDescriptors) {
+      const keys = Object.keys(obj);
+      if (keys.length === 0) return TYPE.OBJECT_EMPTY;
+      return TYPE.OBJECT_LITERAL;
     }
     
     // Get all own properties including non-enumerable ones
@@ -939,9 +1157,10 @@ class TurboSerial {
       shareArrayBuffers: options.shareArrayBuffers !== false,
       simdOptimization: options.simdOptimization !== false,
       detectCircular: options.detectCircular !== false,
-      allowFunction: options.allowFunction || false, // NEW: when false, no function storage/retrieval and no eval()
-      serializeFunctions: options.serializeFunctions || false, // function serialization option
-      preservePropertyDescriptors: options.preservePropertyDescriptors !== false, // descriptor preservation
+      allowFunction: options.allowFunction || false,
+      serializeFunctions: options.serializeFunctions || false,
+      preservePropertyDescriptors: options.preservePropertyDescriptors !== false,
+      sortKeys: options.sortKeys || false, // Skip key sorting for speed (default: false)
       memoryPoolSize: options.memoryPoolSize || 65536,
       ...options
     };
@@ -952,7 +1171,10 @@ class TurboSerial {
     }
 
     this.pool = new UltraMemoryPool(this.options.memoryPoolSize);
-    this.detector = new UltraTypeDetector({ allowFunction: this.options.allowFunction });
+    this.detector = new UltraTypeDetector({
+      allowFunction: this.options.allowFunction,
+      preservePropertyDescriptors: this.options.preservePropertyDescriptors
+    });
     this.simdProcessor = new SIMDProcessor();
     
     // Reference tracking structures
@@ -990,7 +1212,7 @@ class TurboSerial {
   }
 
   /**
-   * Reset serialization state
+   * Reset serialization state (fast path between calls)
    */
   resetState() {
     this.pool.reset();
@@ -998,6 +1220,64 @@ class TurboSerial {
     this.circularRefs.clear();
     this.strings.clear();
     this.buffers.clear();
+  }
+
+  /**
+   * Full memory reset — releases all internal state including the memory pool,
+   * reference tracking, string interning tables, buffer caches, and deserialization state.
+   * 
+   * Use between independent workloads to reclaim memory, prevent cross-operation
+   * data leakage, and reduce GC pressure from accumulated Map/Set entries.
+   * 
+   * Unlike resetState() which only clears tracking maps and resets the write cursor,
+   * resetMemory() also zeros and optionally shrinks the underlying ArrayBuffer,
+   * invalidates all typed view caches, and clears deserialization-side state.
+   * 
+   * @param {Object} [opts] - Reset options
+   * @param {boolean} [opts.shrink=false] - Shrink pool buffer if oversized
+   * @param {boolean} [opts.zero=true] - Zero the pool buffer memory
+   * @param {boolean} [opts.recreateDetector=false] - Rebuild type detector (clears its internal maps)
+   * @returns {TurboSerial} this (for chaining)
+   */
+  resetMemory(opts = {}) {
+    // 1. Full pool memory reset (zeros buffer, invalidates views, optionally shrinks)
+    this.pool.resetMemory({
+      shrink: opts.shrink || false,
+      initialSize: this.options.memoryPoolSize,
+      zero: opts.zero !== false
+    });
+    
+    // 2. Clear all serialization tracking structures
+    this.refs.clear();
+    this.circularRefs.clear();
+    this.strings.clear();
+    this.buffers.clear();
+    
+    // 3. Clear deserialization-side state if present
+    if (this.deserializeRefs) {
+      this.deserializeRefs.length = 0;
+      this.deserializeRefs = null;
+    }
+    if (this.deserializeStrings) {
+      this.deserializeStrings.length = 0;
+      this.deserializeStrings = null;
+    }
+    if (this.deserializeBuffers) {
+      this.deserializeBuffers.length = 0;
+      this.deserializeBuffers = null;
+    }
+    
+    // 4. Release deserialization buffer/view references
+    this.buffer = null;
+    this.view = null;
+    
+    // 5. Optionally recreate type detector to clear its internal maps
+    if (opts.recreateDetector) {
+      this.detector = new UltraTypeDetector({ allowFunction: this.options.allowFunction });
+      this.simdProcessor = new SIMDProcessor();
+    }
+    
+    return this;
   }
 
   /**
@@ -1033,7 +1313,7 @@ class TurboSerial {
         }
       } else {
         for (const key in value) {
-          if (value.hasOwnProperty(key)) {
+          if (Object.prototype.hasOwnProperty.call(value, key)) {
             try {
               this.detectCircularReferences(value[key], visited);
             } catch (e) {
@@ -1365,6 +1645,31 @@ class TurboSerial {
    */
   writeSimpleObject(obj) {
     const keys = Object.keys(obj);
+    
+    // Fast path: when allowFunction is false (default), skip filter entirely
+    if (!this.options.serializeFunctions) {
+      // Direct iteration — no filter, no sort allocation
+      let count = 0;
+      for (let i = 0; i < keys.length; i++) {
+        try { if (typeof obj[keys[i]] !== 'function') count++; } catch(e) { /* skip */ }
+      }
+      this.pool.writeVarint(count);
+      
+      if (this.options.sortKeys) keys.sort();
+      for (let i = 0; i < keys.length; i++) {
+        const key = keys[i];
+        try {
+          const val = obj[key];
+          if (typeof val !== 'function') {
+            this.writeValue(key);
+            this.writeValue(val);
+          }
+        } catch(e) { /* skip inaccessible */ }
+      }
+      return;
+    }
+    
+    // Slow path: serializeFunctions enabled
     const serializableKeys = keys.filter(key => {
       try {
         const val = obj[key];
@@ -1374,7 +1679,7 @@ class TurboSerial {
       }
     });
     
-    serializableKeys.sort(); // Deterministic order
+    if (this.options.sortKeys) serializableKeys.sort();
     this.pool.writeVarint(serializableKeys.length);
     
     for (const key of serializableKeys) {
