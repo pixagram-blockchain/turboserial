@@ -1,5 +1,5 @@
 /**
- * TurboSerial V 0.1.0 - Ultra-Optimized JavaScript Serializer
+ * TurboSerial V 0.2.2 - Ultra-Optimized JavaScript Serializer
  * FULLY OPTIMIZED VERSION with SIMD-style patterns and enhanced type support
  */
 "use strict";
