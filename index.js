@@ -1,1155 +1,108 @@
 /**
- * TurboSerial V 0.2.2 - Ultra-Optimized JavaScript Serializer
- * FULLY OPTIMIZED VERSION with SIMD-style patterns and enhanced type support
+ * TurboSerial v0.3.0 — Full-feature rewrite for raw speed
+ *
+ * Same API & wire-format type codes as v0.1.0.
+ * Architecture: single flat class, no alignment padding, no ensure(),
+ * pre-generated ASCII decoders, asm.js-style coercion.
  */
 "use strict";
 
-// Cache line size for optimal memory access
-const CACHE_LINE_SIZE = 128;
-const SIMD_ALIGNMENT = 8;
-const SIMD_BLOCK_SIZE = 16;
+// ── Pre-generated ASCII decoders (0–127 bytes) ───────────────────────
+const _ascDec = new Array(128);
+for (let n = 0; n < 128; n++) {
+  const a = [];
+  for (let j = 0; j < n; j++) a.push(`b[o+${j}]`);
+  _ascDec[n] = new Function("b", "o", `return String.fromCharCode(${a.join(",")});`);
+}
 
-// Pre-computed constants for branchless operations
-const INT8_MIN = -0x80|0;
-const INT8_MAX = 0x7F|0;
-const INT16_MIN = -0x8000|0;
-const INT16_MAX = 0x7FFF|0;
-const INT32_MIN = -0x80000000|0;
-const INT32_MAX = 0x7FFFFFFF|0;
-const UINT32_MAX = 0xFFFFFFFF>>>0;
+// ── Float32 precision scratch ─────────────────────────────────────────
+const _f32 = new Float32Array(1);
 
-// Type system optimized for bitwise operations
-const TYPE_MASK = {
-  GROUP: 0xF0,
-  SUBTYPE: 0x0F,
-  ALIGNMENT: 0x07
-};
-
-const TYPE_GROUP = {
-  PRIMITIVE: 0x00,
-  NUMBER: 0x10,
-  BIGINT: 0x20,
-  STRING: 0x30,
-  ARRAY: 0x40,
-  OBJECT: 0x50,
-  TYPED: 0x60,
-  BUFFER: 0x70,
-  COLLECTION: 0x80,
-  DATE: 0x90,
-  ERROR: 0xA0,
-  REGEX: 0xB0,
-  BINARY: 0xC0,
-  REFERENCE: 0xD0,
-  SPECIAL: 0xE0,
-  EXTENSION: 0xF0
-};
-
-// Complete type definitions
-const TYPE = {
-  NULL: 0x00,
-  UNDEFINED: 0x01,
-  FALSE: 0x02,
-  TRUE: 0x03,
-  INT8: 0x10,
-  INT16: 0x11,
-  INT32: 0x12,
-  UINT32: 0x13,
-  FLOAT32: 0x14,
-  FLOAT64: 0x15,
-  NAN: 0x16,
-  INFINITY: 0x17,
-  NEG_INFINITY: 0x18,
-  NEG_ZERO: 0x19,
-  VARINT: 0x1A,
-  BIGINT_POS_SMALL: 0x20,
-  BIGINT_NEG_SMALL: 0x21,
-  BIGINT_POS_LARGE: 0x22,
-  BIGINT_NEG_LARGE: 0x23,
-  STRING_EMPTY: 0x30,
-  STRING_ASCII_TINY: 0x31,
-  STRING_ASCII_SHORT: 0x32,
-  STRING_ASCII_LONG: 0x33,
-  STRING_UTF8_TINY: 0x34,
-  STRING_UTF8_SHORT: 0x35,
-  STRING_UTF8_LONG: 0x36,
-  STRING_REF: 0x37,
-  ARRAY_EMPTY: 0x40,
-  ARRAY_DENSE: 0x41,
-  ARRAY_SPARSE: 0x42,
-  ARRAY_PACKED_I8: 0x43,
-  ARRAY_PACKED_I16: 0x44,
-  ARRAY_PACKED_I32: 0x45,
-  ARRAY_PACKED_F32: 0x46,
-  ARRAY_PACKED_F64: 0x47,
-  OBJECT_EMPTY: 0x50,
-  OBJECT_PLAIN: 0x51,
-  OBJECT_LITERAL: 0x52,
-  OBJECT_CONSTRUCTOR: 0x53,
-  OBJECT_WITH_DESCRIPTORS: 0x54, // NEW: for objects with getters/setters
-  OBJECT_WITH_METHODS: 0x55, // NEW: for objects with methods
-  UINT8ARRAY: 0x60,
-  INT8ARRAY: 0x61,
-  UINT8CLAMPEDARRAY: 0x62,
-  UINT16ARRAY: 0x63,
-  INT16ARRAY: 0x64,
-  UINT32ARRAY: 0x65,
-  INT32ARRAY: 0x66,
-  FLOAT32ARRAY: 0x67,
-  FLOAT64ARRAY: 0x68,
-  BIGINT64ARRAY: 0x69,
-  BIGUINT64ARRAY: 0x6A,
-  DATAVIEW: 0x6B,
-  ARRAYBUFFER: 0x70,
-  BUFFER_REF: 0x71,
-  SHAREDARRAYBUFFER: 0x72,
-  MAP: 0x80,
-  SET: 0x81,
-  DATE: 0x90,
-  DATE_INVALID: 0x91,
-  ERROR: 0xA0,
-  EVAL_ERROR: 0xA1,
-  RANGE_ERROR: 0xA2,
-  REFERENCE_ERROR: 0xA3,
-  SYNTAX_ERROR: 0xA4,
-  TYPE_ERROR: 0xA5,
-  URI_ERROR: 0xA6,
-  AGGREGATE_ERROR: 0xA7,
-  CUSTOM_ERROR: 0xA8,
-  REGEXP: 0xB0,
-  BLOB: 0xC0,
-  FILE: 0xC1,
-  REFERENCE: 0xD0,
-  CIRCULAR_REF: 0xD1,
-  SYMBOL: 0xE0,
-  SYMBOL_GLOBAL: 0xE1,
-  SYMBOL_WELLKNOWN: 0xE2,
-  SYMBOL_NO_DESC: 0xE3, // NEW: for symbols without description
-  FUNCTION_PLACEHOLDER: 0xF0 // NEW: for method placeholders
-};
-
-// Pre-computed lookup tables
-const ALIGNMENT_LOOKUP = new Uint8Array(256);
-const BYTES_PER_ELEMENT = new Uint8Array(256);
-const TYPE_CONSTRUCTOR_MAP = new Map();
-
-// Well-known symbols lookup
+// ── Well-known symbols ────────────────────────────────────────────────
 const WELLKNOWN_SYMBOLS = new Map();
-const WELLKNOWN_SYMBOLS_BY_NAME = new Map();
+const WELLKNOWN_BY_NAME = new Map();
+for (const n of [
+  'asyncIterator','hasInstance','isConcatSpreadable','iterator','match',
+  'matchAll','replace','search','species','split','toPrimitive','toStringTag','unscopables'
+]) {
+  const s = Symbol[n];
+  if (s) { WELLKNOWN_SYMBOLS.set(s, n); WELLKNOWN_BY_NAME.set(n, s); }
+}
 
-// Initialize lookup tables
-(function initLookups() {
-  const alignments = [
-    [TYPE.INT16, 2], [TYPE.INT32, 4], [TYPE.UINT32, 4],
-    [TYPE.FLOAT32, 4], [TYPE.FLOAT64, 8],
-    [TYPE.BIGINT_POS_SMALL, 8], [TYPE.BIGINT_NEG_SMALL, 8]
+// ── Type constants (identical to v0.1.0) ──────────────────────────────
+const T = {
+  NULL:0x00,UNDEFINED:0x01,FALSE:0x02,TRUE:0x03,
+  INT8:0x10,INT16:0x11,INT32:0x12,UINT32:0x13,FLOAT32:0x14,FLOAT64:0x15,
+  NAN:0x16,INFINITY:0x17,NEG_INFINITY:0x18,NEG_ZERO:0x19,VARINT:0x1A,
+  BIGINT_POS_SMALL:0x20,BIGINT_NEG_SMALL:0x21,BIGINT_POS_LARGE:0x22,BIGINT_NEG_LARGE:0x23,
+  STRING_EMPTY:0x30,STRING_ASCII_TINY:0x31,STRING_ASCII_SHORT:0x32,STRING_ASCII_LONG:0x33,
+  STRING_UTF8_TINY:0x34,STRING_UTF8_SHORT:0x35,STRING_UTF8_LONG:0x36,STRING_REF:0x37,
+  ARRAY_EMPTY:0x40,ARRAY_DENSE:0x41,ARRAY_SPARSE:0x42,
+  ARRAY_PACKED_I8:0x43,ARRAY_PACKED_I16:0x44,ARRAY_PACKED_I32:0x45,
+  ARRAY_PACKED_F32:0x46,ARRAY_PACKED_F64:0x47,
+  OBJECT_EMPTY:0x50,OBJECT_PLAIN:0x51,OBJECT_LITERAL:0x52,
+  OBJECT_CONSTRUCTOR:0x53,OBJECT_WITH_DESCRIPTORS:0x54,OBJECT_WITH_METHODS:0x55,
+  UINT8ARRAY:0x60,INT8ARRAY:0x61,UINT8CLAMPEDARRAY:0x62,UINT16ARRAY:0x63,
+  INT16ARRAY:0x64,UINT32ARRAY:0x65,INT32ARRAY:0x66,FLOAT32ARRAY:0x67,
+  FLOAT64ARRAY:0x68,BIGINT64ARRAY:0x69,BIGUINT64ARRAY:0x6A,DATAVIEW:0x6B,
+  ARRAYBUFFER:0x70,BUFFER_REF:0x71,SHAREDARRAYBUFFER:0x72,
+  MAP:0x80,SET:0x81,
+  DATE:0x90,DATE_INVALID:0x91,
+  ERROR:0xA0,EVAL_ERROR:0xA1,RANGE_ERROR:0xA2,REFERENCE_ERROR:0xA3,
+  SYNTAX_ERROR:0xA4,TYPE_ERROR:0xA5,URI_ERROR:0xA6,AGGREGATE_ERROR:0xA7,CUSTOM_ERROR:0xA8,
+  REGEXP:0xB0,
+  BLOB:0xC0,FILE:0xC1,
+  REFERENCE:0xD0,CIRCULAR_REF:0xD1,
+  SYMBOL:0xE0,SYMBOL_GLOBAL:0xE1,SYMBOL_WELLKNOWN:0xE2,SYMBOL_NO_DESC:0xE3,
+  FUNCTION_PLACEHOLDER:0xF0,
+};
+
+const GM = 0xF0; // group mask
+
+// ── Lookup tables ─────────────────────────────────────────────────────
+const BPE = [];
+const TCTOR = [];
+{
+  const e = [
+    [0x60,1,'Uint8Array'],[0x61,1,'Int8Array'],[0x62,1,'Uint8ClampedArray'],
+    [0x63,2,'Uint16Array'],[0x64,2,'Int16Array'],[0x65,4,'Uint32Array'],
+    [0x66,4,'Int32Array'],[0x67,4,'Float32Array'],[0x68,8,'Float64Array'],
+    [0x69,8,'BigInt64Array'],[0x6A,8,'BigUint64Array'],[0x6B,1,'DataView'],
+    [0x43,1,null],[0x44,2,null],[0x45,4,null],[0x46,4,null],[0x47,8,null],
   ];
-  
-  for (let i = 0; i < alignments.length; i++) {
-    ALIGNMENT_LOOKUP[alignments[i][0]] = alignments[i][1];
-  }
-  
-  const byteSizes = [
-    [TYPE.UINT8ARRAY, 1], [TYPE.INT8ARRAY, 1], [TYPE.UINT8CLAMPEDARRAY, 1],
-    [TYPE.UINT16ARRAY, 2], [TYPE.INT16ARRAY, 2],
-    [TYPE.UINT32ARRAY, 4], [TYPE.INT32ARRAY, 4], [TYPE.FLOAT32ARRAY, 4],
-    [TYPE.FLOAT64ARRAY, 8], [TYPE.BIGINT64ARRAY, 8], [TYPE.BIGUINT64ARRAY, 8],
-    [TYPE.ARRAY_PACKED_I8, 1], [TYPE.ARRAY_PACKED_I16, 2], [TYPE.ARRAY_PACKED_I32, 4],
-    [TYPE.ARRAY_PACKED_F32, 4], [TYPE.ARRAY_PACKED_F64, 8]
-  ];
-  
-  for (let i = 0; i < byteSizes.length; i++) {
-    BYTES_PER_ELEMENT[byteSizes[i][0]] = byteSizes[i][1];
-  }
-
-  // Initialize well-known symbols
-  const wellKnownNames = [
-    'asyncIterator', 'hasInstance', 'isConcatSpreadable', 'iterator',
-    'match', 'matchAll', 'replace', 'search', 'species', 'split',
-    'toPrimitive', 'toStringTag', 'unscopables'
-  ];
-  
-  for (const name of wellKnownNames) {
-    const symbol = Symbol[name];
-    if (symbol) {
-      WELLKNOWN_SYMBOLS.set(symbol, name);
-      WELLKNOWN_SYMBOLS_BY_NAME.set(name, symbol);
-    }
-  }
-})();
-
-/**
- * Ultra-optimized memory pool with asm.js-style heap architecture
- * Uses Int32Array control heap for JIT-friendly position tracking,
- * getter/setter property accessors for hot-path memory performance,
- * and cache-line aligned allocation strategy.
- */
-class UltraMemoryPool {
-  /**
-   * Initialize memory pool with asm.js-style heap
-   * @param {number} initialSize - Initial buffer size
-   */
-  constructor(initialSize = 65536) {
-    // asm.js-style control heap: [pos, size, generation, peakPos]
-    // Using Int32Array for JIT-optimized integer access
-    this._heap = new Int32Array(4);
-    
-    // Align to cache line
-    const alignedSize = ((initialSize + CACHE_LINE_SIZE - 1) & ~(CACHE_LINE_SIZE - 1)) >>> 0;
-    this._heap[1] = alignedSize; // size
-    this._heap[2] = 0;          // generation (tracks reallocation)
-    this._heap[3] = 0;          // peakPos (high-water mark)
-    
-    this.buffer = new ArrayBuffer(alignedSize);
-    this.u8 = new Uint8Array(this.buffer);
-    this.view = new DataView(this.buffer);
-    
-    // Lazy-initialized typed view cache (invalidated on realloc via generation)
-    this._viewCache = { gen: -1, f32: null, f64: null, i32: null, u32: null };
-  }
-
-  /**
-   * Position getter — reads from asm.js-style heap
-   * JIT engines optimize typed array element access to near-register speed
-   * @returns {number} Current write position
-   */
-  get pos() {
-    return this._heap[0]|0;
-  }
-
-  /**
-   * Position setter — writes to asm.js-style heap with coercion
-   * @param {number} v - New write position
-   */
-  set pos(v) {
-    this._heap[0] = v|0;
-  }
-
-  /**
-   * Size getter — reads from heap
-   * @returns {number} Current buffer capacity
-   */
-  get size() {
-    return this._heap[1]|0;
-  }
-
-  /**
-   * Size setter — writes to heap
-   * @param {number} v - New buffer capacity
-   */
-  set size(v) {
-    this._heap[1] = v|0;
-  }
-
-  /**
-   * Lazy Float32Array view — created on first access, cached until realloc
-   * @returns {Float32Array|null} Aligned view or null if unaligned buffer
-   */
-  get f32View() {
-    const gen = this._heap[2]|0;
-    if (this._viewCache.gen !== gen) this._invalidateViewCache(gen);
-    if (!this._viewCache.f32) {
-      try { this._viewCache.f32 = new Float32Array(this.buffer); } catch(e) { return null; }
-    }
-    return this._viewCache.f32;
-  }
-
-  /**
-   * Lazy Float64Array view
-   * @returns {Float64Array|null}
-   */
-  get f64View() {
-    const gen = this._heap[2]|0;
-    if (this._viewCache.gen !== gen) this._invalidateViewCache(gen);
-    if (!this._viewCache.f64) {
-      try { this._viewCache.f64 = new Float64Array(this.buffer); } catch(e) { return null; }
-    }
-    return this._viewCache.f64;
-  }
-
-  /**
-   * Lazy Int32Array view
-   * @returns {Int32Array|null}
-   */
-  get i32View() {
-    const gen = this._heap[2]|0;
-    if (this._viewCache.gen !== gen) this._invalidateViewCache(gen);
-    if (!this._viewCache.i32) {
-      try { this._viewCache.i32 = new Int32Array(this.buffer); } catch(e) { return null; }
-    }
-    return this._viewCache.i32;
-  }
-
-  /**
-   * Lazy Uint32Array view
-   * @returns {Uint32Array|null}
-   */
-  get u32View() {
-    const gen = this._heap[2]|0;
-    if (this._viewCache.gen !== gen) this._invalidateViewCache(gen);
-    if (!this._viewCache.u32) {
-      try { this._viewCache.u32 = new Uint32Array(this.buffer); } catch(e) { return null; }
-    }
-    return this._viewCache.u32;
-  }
-
-  /**
-   * Invalidate all cached typed views (called on realloc)
-   * @param {number} gen - New generation counter
-   */
-  _invalidateViewCache(gen) {
-    this._viewCache.gen = gen|0;
-    this._viewCache.f32 = null;
-    this._viewCache.f64 = null;
-    this._viewCache.i32 = null;
-    this._viewCache.u32 = null;
-  }
-
-  /**
-   * Ensure capacity with efficient reallocation
-   * Uses asm.js-style coerced arithmetic throughout
-   * @param {number} bytes - Required bytes
-   */
-  ensure(bytes) {
-    bytes = bytes|0;
-    const pos = this._heap[0]|0;
-    const size = this._heap[1]|0;
-    const required = (pos + bytes)|0;
-    
-    if ((required|0) > (size|0)) {
-      // Double size or accommodate requirement
-      const doubled = size << 1;
-      const minRequired = (required + CACHE_LINE_SIZE)|0;
-      const newSize = (doubled > minRequired) ? doubled : minRequired;
-      const alignedSize = ((newSize + CACHE_LINE_SIZE - 1) & ~(CACHE_LINE_SIZE - 1)) >>> 0;
-      
-      const newBuffer = new ArrayBuffer(alignedSize);
-      const newU8 = new Uint8Array(newBuffer);
-      
-      // Bulk copy via subarray — avoids per-element overhead
-      newU8.set(this.u8.subarray(0, pos));
-      
-      this.buffer = newBuffer;
-      this.u8 = newU8;
-      this.view = new DataView(newBuffer);
-      this._heap[1] = alignedSize;
-      
-      // Bump generation to invalidate cached typed views
-      this._heap[2] = (this._heap[2] + 1)|0;
-    }
-  }
-
-  /**
-   * Align position for optimal SIMD-style memory access
-   * Uses branchless bitmask alignment
-   * @param {number} alignment - Required alignment (must be power of 2)
-   */
-  alignPos(alignment) {
-    const mask = (alignment - 1)|0;
-    this._heap[0] = ((this._heap[0] + mask) & ~mask) >>> 0;
-  }
-
-  /**
-   * Write unsigned 8-bit integer — inlined hot path
-   * @param {number} value - Value to write
-   */
-  writeU8(value) {
-    this.ensure(1);
-    this.u8[this._heap[0]++] = value & 0xFF;
-  }
-
-  /**
-   * Write unsigned 16-bit integer with alignment
-   * @param {number} value - Value to write
-   */
-  writeU16(value) {
-    this.alignPos(2);
-    this.ensure(2);
-    const p = this._heap[0]|0;
-    this.view.setUint16(p, value & 0xFFFF, true);
-    this._heap[0] = (p + 2)|0;
-  }
-
-  /**
-   * Write signed 16-bit integer with alignment
-   * @param {number} value - Value to write
-   */
-  writeI16(value) {
-    this.alignPos(2);
-    this.ensure(2);
-    const p = this._heap[0]|0;
-    this.view.setInt16(p, value|0, true);
-    this._heap[0] = (p + 2)|0;
-  }
-
-  /**
-   * Write unsigned 32-bit integer with alignment
-   * @param {number} value - Value to write
-   */
-  writeU32(value) {
-    this.alignPos(4);
-    this.ensure(4);
-    const p = this._heap[0]|0;
-    this.view.setUint32(p, value >>> 0, true);
-    this._heap[0] = (p + 4)|0;
-  }
-
-  /**
-   * Write signed 32-bit integer with alignment
-   * @param {number} value - Value to write
-   */
-  writeI32(value) {
-    this.alignPos(4);
-    this.ensure(4);
-    const p = this._heap[0]|0;
-    this.view.setInt32(p, value|0, true);
-    this._heap[0] = (p + 4)|0;
-  }
-
-  /**
-   * Write 32-bit float with alignment
-   * @param {number} value - Value to write
-   */
-  writeF32(value) {
-    this.alignPos(4);
-    this.ensure(4);
-    const p = this._heap[0]|0;
-    this.view.setFloat32(p, +value, true);
-    this._heap[0] = (p + 4)|0;
-  }
-
-  /**
-   * Write 64-bit float with alignment
-   * @param {number} value - Value to write
-   */
-  writeF64(value) {
-    this.alignPos(8);
-    this.ensure(8);
-    const p = this._heap[0]|0;
-    this.view.setFloat64(p, +value, true);
-    this._heap[0] = (p + 8)|0;
-  }
-
-  /**
-   * Write BigInt as 64-bit integer
-   * @param {BigInt} value - Value to write
-   */
-  writeBigInt64(value) {
-    this.alignPos(8);
-    this.ensure(8);
-    const p = this._heap[0]|0;
-    this.view.setBigInt64(p, BigInt(value), true);
-    this._heap[0] = (p + 8)|0;
-  }
-
-  /**
-   * Write variable-length integer with optimized encoding
-   * @param {number} value - Value to write
-   */
-  writeVarint(value) {
-    value = value >>> 0;
-    this.ensure(5);
-    
-    // Optimized small value path — single byte, no loop
-    if (value < 0x80) {
-      this.u8[this._heap[0]++] = value;
-      return;
-    }
-    
-    // Optimized medium value path — 2 bytes, no loop
-    if (value < 0x4000) {
-      const p = this._heap[0]|0;
-      this.u8[p] = (value & 0x7F) | 0x80;
-      this.u8[p + 1] = value >>> 7;
-      this._heap[0] = (p + 2)|0;
-      return;
-    }
-    
-    // General case with direct heap access
-    let p = this._heap[0]|0;
-    do {
-      this.u8[p++] = (value & 0x7F) | 0x80;
-      value >>>= 7;
-    } while (value >= 0x80);
-    this.u8[p++] = value;
-    this._heap[0] = p;
-  }
-
-  /**
-   * Write packed array with optimal type-specific handling
-   * @param {Array} array - Array to write
-   * @param {number} elementType - Element type identifier
-   */
-  writePackedArray(array, elementType) {
-    const len = array.length|0;
-    this.writeVarint(len);
-    
-    const elementSize = BYTES_PER_ELEMENT[elementType]|0;
-    if (!elementSize) {
-      throw new Error(`Unknown element type: 0x${elementType.toString(16)}`);
-    }
-    
-    this.alignPos(Math.min(elementSize, 8));
-    this.ensure(len * elementSize);
-    
-    // Use typed array views for SIMD-style bulk writes
-    switch (elementType) {
-      case TYPE.ARRAY_PACKED_I8: {
-        const p = this._heap[0]|0;
-        const view = new Int8Array(this.buffer, p, len);
-        view.set(array);
-        this._heap[0] = (p + len)|0;
-        break;
-      }
-      case TYPE.ARRAY_PACKED_I16: {
-        const p = this._heap[0]|0;
-        const view = new Int16Array(this.buffer, p, len);
-        for (let i = 0; i < len; i++) view[i] = array[i]|0;
-        this._heap[0] = (p + (len << 1))|0;
-        break;
-      }
-      case TYPE.ARRAY_PACKED_I32: {
-        const p = this._heap[0]|0;
-        const view = new Int32Array(this.buffer, p, len);
-        for (let i = 0; i < len; i++) view[i] = array[i]|0;
-        this._heap[0] = (p + (len << 2))|0;
-        break;
-      }
-      case TYPE.ARRAY_PACKED_F32: {
-        const p = this._heap[0]|0;
-        const view = new Float32Array(this.buffer, p, len);
-        for (let i = 0; i < len; i++) view[i] = +array[i];
-        this._heap[0] = (p + (len << 2))|0;
-        break;
-      }
-      case TYPE.ARRAY_PACKED_F64: {
-        const p = this._heap[0]|0;
-        const view = new Float64Array(this.buffer, p, len);
-        for (let i = 0; i < len; i++) view[i] = +array[i];
-        this._heap[0] = (p + (len << 3))|0;
-        break;
-      }
-      default:
-        throw new Error(`Unsupported packed array type: 0x${elementType.toString(16)}`);
-    }
-  }
-
-  /**
-   * Write bulk data with alignment
-   * @param {Uint8Array} data - Data to write
-   * @param {number} elementSize - Element size for alignment
-   */
-  writeBulkAligned(data, elementSize) {
-    const alignment = Math.min(elementSize, SIMD_ALIGNMENT);
-    this.alignPos(alignment);
-    
-    const totalBytes = (data.byteLength || data.length)|0;
-    this.ensure(totalBytes);
-    
-    const p = this._heap[0]|0;
-    // Use subarray for efficient copy
-    if (data.buffer && data.byteOffset !== undefined) {
-      const sourceBytes = new Uint8Array(data.buffer, data.byteOffset, totalBytes);
-      this.u8.set(sourceBytes, p);
-    } else {
-      this.u8.set(data, p);
-    }
-    
-    this._heap[0] = (p + totalBytes)|0;
-  }
-
-  /**
-   * Reset pool position (fast path for serialize cycles)
-   * Snapshots high-water mark before resetting for shrink intelligence
-   */
-  reset() {
-    // Snapshot peak before resetting
-    const pos = this._heap[0]|0;
-    const peak = this._heap[3]|0;
-    this._heap[3] = (pos > peak) ? pos : peak;
-    this._heap[0] = 0;
-  }
-
-  /**
-   * Full memory reset — zeros the used region, resets all heap counters,
-   * invalidates typed view caches, and optionally shrinks the buffer.
-   * Call between independent serialize batches to reclaim GC pressure
-   * and prevent stale data leakage between operations.
-   * 
-   * @param {Object} [opts] - Reset options
-   * @param {boolean} [opts.shrink=false] - Shrink buffer to initial size if oversized
-   * @param {number} [opts.initialSize=65536] - Target size when shrinking
-   * @param {boolean} [opts.zero=true] - Zero the buffer memory (security/GC)
-   */
-  resetMemory(opts = {}) {
-    const shrink = opts.shrink || false;
-    const initialSize = opts.initialSize || 65536;
-    const zero = opts.zero !== false;
-    
-    // Finalize peak measurement
-    const pos = this._heap[0]|0;
-    const storedPeak = this._heap[3]|0;
-    const peak = (pos > storedPeak) ? pos : storedPeak;
-    const currentSize = this._heap[1]|0;
-    
-    // Optionally shrink oversized buffers (>4x initial and peak usage <50% of current)
-    const alignedInitial = ((initialSize + CACHE_LINE_SIZE - 1) & ~(CACHE_LINE_SIZE - 1)) >>> 0;
-    if (shrink && currentSize > (alignedInitial << 2) && peak < (currentSize >>> 1)) {
-      // Reallocate to a smaller aligned buffer
-      const newSize = Math.max(alignedInitial, ((peak << 1) + CACHE_LINE_SIZE - 1) & ~(CACHE_LINE_SIZE - 1)) >>> 0;
-      this.buffer = new ArrayBuffer(newSize);
-      this.u8 = new Uint8Array(this.buffer);
-      this.view = new DataView(this.buffer);
-      this._heap[1] = newSize;
-      // Bump generation for view cache invalidation
-      this._heap[2] = (this._heap[2] + 1)|0;
-    } else if (zero && peak > 0) {
-      // Zero only the used region — avoids O(n) on the whole buffer
-      this.u8.fill(0, 0, peak);
-    }
-    
-    // Reset all heap counters
-    this._heap[0] = 0; // pos
-    this._heap[3] = 0; // peakPos
-    
-    // Force view cache invalidation
-    this._invalidateViewCache(this._heap[2]|0);
-  }
-
-  /**
-   * Get result buffer as subarray view (zero-copy)
-   * Also snapshots peak position for shrink intelligence
-   * @returns {Uint8Array} Result buffer slice
-   */
-  getResult() {
-    const pos = this._heap[0]|0;
-    // Snapshot peak
-    const peak = this._heap[3]|0;
-    this._heap[3] = (pos > peak) ? pos : peak;
-    return this.u8.subarray(0, pos);
+  for (const [t,b,name] of e) {
+    BPE[t] = b;
+    if (name && globalThis[name]) TCTOR[t] = globalThis[name];
   }
 }
 
-/**
- * SIMD-style processor for vectorized operations
- * Uses asm.js coercion patterns for JIT-optimized numeric analysis
- */
-class SIMDProcessor {
-  constructor() {
-    this.blockSize = SIMD_BLOCK_SIZE|0;
-    // Pre-allocated scratch buffer for float32 precision checks (avoids per-call alloc)
-    this._f32Scratch = new Float32Array(1);
-  }
-
-  /**
-   * Check if array can be optimized with SIMD-style processing
-   * Uses branchless bitwise checks for fast rejection
-   * @param {Array} array - Array to check
-   * @returns {boolean} True if optimizable
-   */
-  canOptimize(array) {
-    const len = array.length|0;
-    
-    // Branchless size check: >= 8 AND (power-of-2 OR >= 16)
-    const isGoodSize = ((len >= 8) & ((len & (len - 1)) == 0 | len >= 16))|0;
-    if (!isGoodSize) return false;
-    
-    // Fast type check
-    if (typeof array[0] !== 'number') return false;
-    
-    // Sample-based homogeneity check with coerced interval
-    const sampleInterval = Math.max(1, (len >>> 5)|0)|0;
-    for (let i = sampleInterval|0; (i|0) < (len|0); i = (i + sampleInterval)|0) {
-      if (typeof array[i] !== 'number') return false;
-    }
-    
-    return true;
-  }
-
-  /**
-   * Analyze numeric array for optimal packing using SIMD-lane-style block processing
-   * Processes 4 elements per iteration (simulating 128-bit SIMD lanes)
-   * @param {Array} array - Array to analyze
-   * @returns {Object} Analysis result with type and element size
-   */
-  analyzeNumericArray(array) {
-    let isInteger = 1;
-    let min = +Infinity;
-    let max = -Infinity;
-    let canBeFloat32 = 1;
-    
-    const len = array.length|0;
-    const f32 = this._f32Scratch;
-    
-    // Process in 4-wide SIMD-style lanes for better ILP
-    const blockEnd = (len & ~3)|0; // len rounded down to multiple of 4
-    
-    for (let i = 0; (i|0) < (blockEnd|0); i = (i + 4)|0) {
-      const v0 = +array[i];
-      const v1 = +array[i + 1];
-      const v2 = +array[i + 2];
-      const v3 = +array[i + 3];
-      
-      // Integer check — 4 lanes
-      isInteger &= +((v0|0) == v0) & +((v1|0) == v1) & +((v2|0) == v2) & +((v3|0) == v3);
-      
-      // Min/max reduction — 2-level pairwise
-      const lo = v0 < v1 ? v0 : v1;
-      const hi = v0 > v1 ? v0 : v1;
-      const lo2 = v2 < v3 ? v2 : v3;
-      const hi2 = v2 > v3 ? v2 : v3;
-      min = (lo < lo2 ? lo : lo2) < min ? (lo < lo2 ? lo : lo2) : min;
-      max = (hi > hi2 ? hi : hi2) > max ? (hi > hi2 ? hi : hi2) : max;
-      
-      // Float32 precision check — 4 lanes
-      if (canBeFloat32) {
-        f32[0] = v0; canBeFloat32 &= +(f32[0] == v0);
-        f32[0] = v1; canBeFloat32 &= +(f32[0] == v1);
-        f32[0] = v2; canBeFloat32 &= +(f32[0] == v2);
-        f32[0] = v3; canBeFloat32 &= +(f32[0] == v3);
-      }
-    }
-    
-    // Scalar tail
-    for (let i = blockEnd|0; (i|0) < (len|0); i = (i + 1)|0) {
-      const val = +array[i];
-      const intVal = val|0;
-      isInteger &= +(val == intVal);
-      min = val < min ? val : min;
-      max = val > max ? val : max;
-      if (canBeFloat32) {
-        f32[0] = val;
-        canBeFloat32 &= +(f32[0] == val);
-      }
-    }
-    
-    if (isInteger) {
-      const absMax = Math.max(Math.abs(min), Math.abs(max));
-      
-      // Branchless type selection using bit manipulation
-      const typeIndex = 
-        (+(absMax <= 0x7F) << 0) |
-        (+(absMax <= 0x7FFF) << 1) |
-        (+(absMax <= 0x7FFFFFFF) << 2);
-      
-      const types = [
-        { type: TYPE.ARRAY_PACKED_I32, elementSize: 4 },
-        { type: TYPE.ARRAY_PACKED_I8, elementSize: 1 },
-        { type: TYPE.ARRAY_PACKED_I16, elementSize: 2 },
-        { type: TYPE.ARRAY_PACKED_I32, elementSize: 4 }
-      ];
-      
-      return types[typeIndex & 3];
-    }
-    
-    return canBeFloat32 
-      ? { type: TYPE.ARRAY_PACKED_F32, elementSize: 4 }
-      : { type: TYPE.ARRAY_PACKED_F64, elementSize: 8 };
-  }
+const CTOR_MAP = new Map();
+{
+  const pairs = [
+    [Date,T.DATE],[RegExp,T.REGEXP],[Map,T.MAP],[Set,T.SET],[ArrayBuffer,T.ARRAYBUFFER],
+  ];
+  const ta = ['Uint8Array','Int8Array','Uint8ClampedArray','Uint16Array','Int16Array',
+    'Uint32Array','Int32Array','Float32Array','Float64Array','BigInt64Array','BigUint64Array','DataView'];
+  for (const [c,t] of pairs) CTOR_MAP.set(c,t);
+  for (let i = 0; i < ta.length; i++) { const c = globalThis[ta[i]]; if (c) CTOR_MAP.set(c, 0x60+i); }
+  if (globalThis.SharedArrayBuffer) CTOR_MAP.set(SharedArrayBuffer, T.SHAREDARRAYBUFFER);
 }
 
-/**
- * Ultra-fast type detector with branchless operations
- */
-class UltraTypeDetector {
-  constructor(options = {}) {
-    this.simdProcessor = new SIMDProcessor();
-    this.allowFunction = options.allowFunction || false;
-    this.preserveDescriptors = options.preservePropertyDescriptors !== false;
-    
-    // Pre-allocated scratch buffers for detectNumber — avoids per-call allocation
-    this._numF64 = new Float64Array(1);
-    this._numU32 = new Uint32Array(this._numF64.buffer);
-    
-    // Shared TextEncoder for detectString — avoids per-call allocation
-    this._encoder = new TextEncoder();
-    
-    // Pre-computed maps for O(1) lookups
-    this.constructorMap = new Map();
-    this.typeNameMap = new Map();
-    this.errorTypeMap = new Map();
-    
-    this.initMaps();
-  }
+const ERR_CTORS = {
+  [T.ERROR]:Error,[T.EVAL_ERROR]:EvalError,[T.RANGE_ERROR]:RangeError,
+  [T.REFERENCE_ERROR]:ReferenceError,[T.SYNTAX_ERROR]:SyntaxError,
+  [T.TYPE_ERROR]:TypeError,[T.URI_ERROR]:URIError,
+};
+const ERR_NAMES = new Map([
+  ['Error',T.ERROR],['EvalError',T.EVAL_ERROR],['RangeError',T.RANGE_ERROR],
+  ['ReferenceError',T.REFERENCE_ERROR],['SyntaxError',T.SYNTAX_ERROR],
+  ['TypeError',T.TYPE_ERROR],['URIError',T.URI_ERROR],['AggregateError',T.AGGREGATE_ERROR],
+]);
 
-  /**
-   * Initialize lookup maps
-   */
-  initMaps() {
-    // Constructor mappings
-    const constructors = [
-      [Date, TYPE.DATE],
-      [RegExp, TYPE.REGEXP],
-      [Map, TYPE.MAP],
-      [Set, TYPE.SET],
-      [ArrayBuffer, TYPE.ARRAYBUFFER],
-      [DataView, TYPE.DATAVIEW]
-    ];
-    
-    // Add typed array constructors
-    const typedArrays = [
-      ['Uint8Array', TYPE.UINT8ARRAY],
-      ['Int8Array', TYPE.INT8ARRAY],
-      ['Uint8ClampedArray', TYPE.UINT8CLAMPEDARRAY],
-      ['Uint16Array', TYPE.UINT16ARRAY],
-      ['Int16Array', TYPE.INT16ARRAY],
-      ['Uint32Array', TYPE.UINT32ARRAY],
-      ['Int32Array', TYPE.INT32ARRAY],
-      ['Float32Array', TYPE.FLOAT32ARRAY],
-      ['Float64Array', TYPE.FLOAT64ARRAY],
-      ['BigInt64Array', TYPE.BIGINT64ARRAY],
-      ['BigUint64Array', TYPE.BIGUINT64ARRAY],
-      ['SharedArrayBuffer', TYPE.SHAREDARRAYBUFFER]
-    ];
-    
-    for (const [ctor, type] of constructors) {
-      this.constructorMap.set(ctor, type);
-    }
-    
-    for (const [name, type] of typedArrays) {
-      const ctor = globalThis[name];
-      if (ctor) {
-        this.constructorMap.set(ctor, type);
-        this.typeNameMap.set(name, type);
-      }
-    }
-    
-    // Error type mappings
-    this.errorTypeMap.set('Error', TYPE.ERROR);
-    this.errorTypeMap.set('EvalError', TYPE.EVAL_ERROR);
-    this.errorTypeMap.set('RangeError', TYPE.RANGE_ERROR);
-    this.errorTypeMap.set('ReferenceError', TYPE.REFERENCE_ERROR);
-    this.errorTypeMap.set('SyntaxError', TYPE.SYNTAX_ERROR);
-    this.errorTypeMap.set('TypeError', TYPE.TYPE_ERROR);
-    this.errorTypeMap.set('URIError', TYPE.URI_ERROR);
-    this.errorTypeMap.set('AggregateError', TYPE.AGGREGATE_ERROR);
-  }
+const MAGIC = 0x54425236; // TBR6
 
-  /**
-   * Detect type of value with optimized branching
-   * @param {*} value - Value to detect
-   * @returns {number} Type identifier
-   */
-  detect(value) {
-    // Optimized null check
-    if (value == null) return value === null ? TYPE.NULL : TYPE.UNDEFINED;
-    
-    // Fast type dispatch using switch
-    const typeStr = typeof value;
-    
-    switch (typeStr) {
-      case 'boolean':
-        return value ? TYPE.TRUE : TYPE.FALSE;
-      case 'number':
-        return this.detectNumber(value);
-      case 'bigint':
-        return this.detectBigInt(value);
-      case 'string':
-        return this.detectString(value);
-      case 'symbol':
-        return this.detectSymbol(value);
-      case 'object':
-        return this.detectObject(value);
-      case 'function':
-        return TYPE.UNDEFINED;
-      default:
-        return TYPE.UNDEFINED;
-    }
-  }
-
-  /**
-   * Detect number type with branchless operations
-   * @param {number} value - Number to detect
-   * @returns {number} Type identifier
-   */
-  detectNumber(value) {
-    // Fast NaN check
-    if (value !== value) return TYPE.NAN;
-    
-    // Use pre-allocated scratch buffers — zero allocation
-    this._numF64[0] = value;
-    const highBits = this._numU32[1];
-    
-    // Check for infinity: exponent all 1s, mantissa 0
-    const expMask = 0x7FF00000;
-    const isInfinity = ((highBits & expMask) == expMask) & ((this._numU32[0] == 0) & ((highBits & 0xFFFFF) == 0));
-    
-    if (isInfinity) {
-      return (highBits >>> 31) ? TYPE.NEG_INFINITY : TYPE.INFINITY;
-    }
-    
-    // Check for negative zero
-    if (value == 0 && (highBits >>> 31)) return TYPE.NEG_ZERO;
-    
-    // Integer check with branchless classification
-    const intValue = value|0;
-    if (value == intValue) {
-      const absValue = Math.abs(value);
-      
-      // Branchless type selection
-      const typeIndex = 
-        (+(absValue <= 0x7F) << 0) |
-        (+(absValue <= 0x7FFF) << 1) |
-        (+(absValue <= 0x7FFFFFFF) << 2);
-      
-      const types = [TYPE.VARINT, TYPE.INT8, TYPE.INT16, TYPE.INT32];
-      return types[Math.min(typeIndex, 3)];
-    }
-    
-    // Float precision check
-    const f32Value = Math.fround(value);
-    return (f32Value == value) ? TYPE.FLOAT32 : TYPE.FLOAT64;
-  }
-
-  /**
-   * Detect BigInt type
-   * @param {BigInt} value - BigInt to detect
-   * @returns {number} Type identifier
-   */
-  detectBigInt(value) {
-    const isNegative = value < 0n;
-    const absValue = isNegative ? -value : value;
-    
-    // Check if fits in 64 bits
-    const fits64Bit = absValue <= 0x7FFFFFFFFFFFFFFFn;
-    
-    return fits64Bit
-      ? (isNegative ? TYPE.BIGINT_NEG_SMALL : TYPE.BIGINT_POS_SMALL)
-      : (isNegative ? TYPE.BIGINT_NEG_LARGE : TYPE.BIGINT_POS_LARGE);
-  }
-
-  /**
-   * Detect string type with optimized checks
-   * @param {string} value - String to detect
-   * @returns {number} Type identifier
-   */
-  detectString(value) {
-    const len = value.length;
-    
-    if (len == 0) return TYPE.STRING_EMPTY;
-    
-    // Fast ASCII check with early exit
-    let isAscii = 1;
-    for (let i = 0; i < len && isAscii; i++) {
-      isAscii &= +(value.charCodeAt(i) <= 0x7F);
-    }
-    
-    if (isAscii) {
-      // Branchless size selection
-      return (len < 16) ? TYPE.STRING_ASCII_TINY :
-             (len < 256) ? TYPE.STRING_ASCII_SHORT :
-             TYPE.STRING_ASCII_LONG;
-    } else {
-      const byteLength = this._encoder.encode(value).length;
-      return (byteLength < 16) ? TYPE.STRING_UTF8_TINY :
-             (byteLength < 256) ? TYPE.STRING_UTF8_SHORT :
-             TYPE.STRING_UTF8_LONG;
-    }
-  }
-
-  /**
-   * FIXED: Detect symbol type with proper handling of descriptions
-   * @param {Symbol} value - Symbol to detect
-   * @returns {number} Type identifier
-   */
-  detectSymbol(value) {
-    // Check for global symbol first
-    const key = Symbol.keyFor(value);
-    if (key !== undefined) {
-      return TYPE.SYMBOL_GLOBAL;
-    }
-    
-    // Check for well-known symbol
-    if (WELLKNOWN_SYMBOLS.has(value)) {
-      return TYPE.SYMBOL_WELLKNOWN;
-    }
-    
-    // FIXED: Distinguish between Symbol() and Symbol("")
-    const description = value.description;
-    if (description === undefined) {
-      return TYPE.SYMBOL_NO_DESC; // NEW: Symbol without description
-    }
-    
-    return TYPE.SYMBOL; // Symbol with description (including empty string)
-  }
-
-  /**
-   * FIXED: Detect object type with enhanced property analysis
-   * @param {Object} obj - Object to detect
-   * @returns {number} Type identifier
-   */
-  detectObject(obj) {
-    if (obj == null) return TYPE.NULL;
-    
-    const constructor = obj.constructor;
-    
-    // Fast constructor lookup
-    const mappedType = this.constructorMap.get(constructor);
-    if (mappedType !== undefined) {
-      // Special handling for invalid dates
-      if (mappedType == TYPE.DATE) {
-        const time = obj.getTime();
-        return (time == time) ? TYPE.DATE : TYPE.DATE_INVALID;
-      }
-      return mappedType;
-    }
-    
-    // Array detection with optimization analysis
-    if (Array.isArray(obj)) {
-      return this.detectArray(obj);
-    }
-    
-    // Typed array detection
-    if (ArrayBuffer.isView(obj)) {
-      return this.detectTypedArrayType(obj);
-    }
-    
-    // Error detection
-    if (obj instanceof Error) {
-      return this.detectErrorType(obj);
-    }
-    
-    // Binary object detection
-    if (typeof Blob !== 'undefined' && obj instanceof Blob) {
-      return (obj instanceof File) ? TYPE.FILE : TYPE.BLOB;
-    }
-    
-    // FIXED: Enhanced object classification
-    return this.classifyObject(obj);
-  }
-
-  /**
-   * NEW: Enhanced object classification with descriptor analysis
-   * @param {Object} obj - Object to classify
-   * @returns {number} Type identifier
-   */
-  classifyObject(obj) {
-    const proto = Object.getPrototypeOf(obj);
-    const isPlainObject = (obj.constructor == Object) || (proto == Object.prototype) || (proto == null);
-    
-    if (!isPlainObject) {
-      return TYPE.OBJECT_CONSTRUCTOR;
-    }
-    
-    // Fast path: skip descriptor analysis when not preserving them
-    if (!this.preserveDescriptors) {
-      const keys = Object.keys(obj);
-      if (keys.length === 0) return TYPE.OBJECT_EMPTY;
-      return TYPE.OBJECT_LITERAL;
-    }
-    
-    // Get all own properties including non-enumerable ones
-    const ownKeys = Object.getOwnPropertyNames(obj);
-    const ownSymbols = Object.getOwnPropertySymbols(obj);
-    const allKeys = [...ownKeys, ...ownSymbols];
-    
-    if (allKeys.length === 0) {
-      return TYPE.OBJECT_EMPTY;
-    }
-    
-    // Check for complex property descriptors
-    let hasComplexDescriptors = false;
-    let hasMethods = false;
-    
-    for (const key of allKeys) {
-      const descriptor = Object.getOwnPropertyDescriptor(obj, key);
-      
-      // Check for getters/setters
-      if (descriptor.get || descriptor.set) {
-        hasComplexDescriptors = true;
-        break;
-      }
-      
-      // Check for methods (only when allowFunction is enabled)
-      if (typeof descriptor.value === 'function') {
-        if (this.allowFunction) {
-          hasMethods = true;
-        }
-        // When allowFunction is false, functions are ignored entirely
-      }
-      
-      // Check for non-default attributes
-      if (!descriptor.enumerable || !descriptor.writable || !descriptor.configurable) {
-        hasComplexDescriptors = true;
-      }
-    }
-    
-    if (hasComplexDescriptors) {
-      return TYPE.OBJECT_WITH_DESCRIPTORS;
-    }
-    
-    if (hasMethods) {
-      return TYPE.OBJECT_WITH_METHODS;
-    }
-    
-    return TYPE.OBJECT_LITERAL;
-  }
-
-  /**
-   * Detect array type with sparsity and optimization analysis
-   * @param {Array} arr - Array to detect
-   * @returns {number} Type identifier
-   */
-  detectArray(arr) {
-    const len = arr.length;
-    
-    if (len == 0) return TYPE.ARRAY_EMPTY;
-    
-    // Fast sparsity check
-    let filledCount = 0;
-    let hasHoles = false;
-    
-    for (let i = 0; i < len; i++) {
-      if (i in arr) {
-        filledCount++;
-      } else {
-        hasHoles = true;
-      }
-    }
-    
-    // Sparse if has holes or less than 75% filled
-    const sparsityThreshold = (len * 3) >>> 2;
-    if (hasHoles || filledCount < sparsityThreshold) {
-      return TYPE.ARRAY_SPARSE;
-    }
-    
-    // Check for SIMD optimization potential
-    if (this.simdProcessor.canOptimize(arr)) {
-      const analysis = this.simdProcessor.analyzeNumericArray(arr);
-      return analysis.type;
-    }
-    
-    return TYPE.ARRAY_DENSE;
-  }
-
-  /**
-   * Detect typed array type using fast lookup
-   * @param {Object} obj - Typed array to detect
-   * @returns {number} Type identifier
-   */
-  detectTypedArrayType(obj) {
-    const name = obj.constructor.name;
-    return this.typeNameMap.get(name) || TYPE.UINT8ARRAY;
-  }
-
-  /**
-   * Detect error type using fast lookup
-   * @param {Error} err - Error to detect
-   * @returns {number} Type identifier
-   */
-  detectErrorType(err) {
-    const name = err.constructor.name;
-    return this.errorTypeMap.get(name) || TYPE.CUSTOM_ERROR;
-  }
-}
-
-/**
- * Main TurboSerial class with full optimization
- */
+// ── TurboSerial ───────────────────────────────────────────────────────
 class TurboSerial {
-  /**
-   * Initialize TurboSerial with options
-   * @param {Object} options - Serialization options
-   */
   constructor(options = {}) {
     this.options = {
       compression: options.compression || false,
@@ -1160,1714 +113,791 @@ class TurboSerial {
       allowFunction: options.allowFunction || false,
       serializeFunctions: options.serializeFunctions || false,
       preservePropertyDescriptors: options.preservePropertyDescriptors !== false,
-      sortKeys: options.sortKeys || false, // Skip key sorting for speed (default: false)
+      sortKeys: options.sortKeys || false,
       memoryPoolSize: options.memoryPoolSize || 65536,
       ...options
     };
+    if (!this.options.allowFunction) this.options.serializeFunctions = false;
 
-    // When allowFunction is false, force serializeFunctions off to prevent any eval() calls
-    if (!this.options.allowFunction) {
-      this.options.serializeFunctions = false;
-    }
-
-    this.pool = new UltraMemoryPool(this.options.memoryPoolSize);
-    this.detector = new UltraTypeDetector({
-      allowFunction: this.options.allowFunction,
-      preservePropertyDescriptors: this.options.preservePropertyDescriptors
-    });
-    this.simdProcessor = new SIMDProcessor();
-    
-    // Reference tracking structures
+    const sz = Math.max(this.options.memoryPoolSize, 65536);
+    this.buf = new Uint8Array(sz);
+    this.dv = new DataView(this.buf.buffer);
+    this.pos = 0;
+    this.enc = new TextEncoder();
+    this.dec = new TextDecoder();
+    // Serialize tracking
     this.refs = new Map();
     this.circularRefs = new Set();
     this.strings = new Map();
     this.buffers = new Map();
-    
-    // Pre-allocate encoders
-    this.encoder = new TextEncoder();
-    this.decoder = new TextDecoder();
-  }
-
-  /**
-   * Serialize value to binary format
-   * @param {*} value - Value to serialize
-   * @returns {Uint8Array} Serialized data
-   */
-  serialize(value) {
-    this.resetState();
-    
-    // Write header
-    this.pool.writeU32(0x54425235); // 'TBR5'
-    this.pool.writeU8(5); // Version
-    
-    // Detect circular references if needed
-    if (this.options.detectCircular) {
-      this.detectCircularReferences(value, new WeakSet());
-    }
-    
-    // Serialize value
-    this.writeValue(value);
-    
-    return this.pool.getResult();
-  }
-
-  /**
-   * Reset serialization state (fast path between calls)
-   */
-  resetState() {
-    this.pool.reset();
-    this.refs.clear();
-    this.circularRefs.clear();
-    this.strings.clear();
-    this.buffers.clear();
-  }
-
-  /**
-   * Full memory reset — releases all internal state including the memory pool,
-   * reference tracking, string interning tables, buffer caches, and deserialization state.
-   * 
-   * Use between independent workloads to reclaim memory, prevent cross-operation
-   * data leakage, and reduce GC pressure from accumulated Map/Set entries.
-   * 
-   * Unlike resetState() which only clears tracking maps and resets the write cursor,
-   * resetMemory() also zeros and optionally shrinks the underlying ArrayBuffer,
-   * invalidates all typed view caches, and clears deserialization-side state.
-   * 
-   * @param {Object} [opts] - Reset options
-   * @param {boolean} [opts.shrink=false] - Shrink pool buffer if oversized
-   * @param {boolean} [opts.zero=true] - Zero the pool buffer memory
-   * @param {boolean} [opts.recreateDetector=false] - Rebuild type detector (clears its internal maps)
-   * @returns {TurboSerial} this (for chaining)
-   */
-  resetMemory(opts = {}) {
-    // 1. Full pool memory reset (zeros buffer, invalidates views, optionally shrinks)
-    this.pool.resetMemory({
-      shrink: opts.shrink || false,
-      initialSize: this.options.memoryPoolSize,
-      zero: opts.zero !== false
-    });
-    
-    // 2. Clear all serialization tracking structures
-    this.refs.clear();
-    this.circularRefs.clear();
-    this.strings.clear();
-    this.buffers.clear();
-    
-    // 3. Clear deserialization-side state if present
-    if (this.deserializeRefs) {
-      this.deserializeRefs.length = 0;
-      this.deserializeRefs = null;
-    }
-    if (this.deserializeStrings) {
-      this.deserializeStrings.length = 0;
-      this.deserializeStrings = null;
-    }
-    if (this.deserializeBuffers) {
-      this.deserializeBuffers.length = 0;
-      this.deserializeBuffers = null;
-    }
-    
-    // 4. Release deserialization buffer/view references
+    // Deserialize state
+    this.deserializeRefs = null;
+    this.deserializeStrings = null;
+    this.deserializeBuffers = null;
     this.buffer = null;
     this.view = null;
-    
-    // 5. Optionally recreate type detector to clear its internal maps
-    if (opts.recreateDetector) {
-      this.detector = new UltraTypeDetector({ allowFunction: this.options.allowFunction });
-      this.simdProcessor = new SIMDProcessor();
-    }
-    
+  }
+
+  // ── Ensure capacity (grows buffer if needed) ──────────────────────
+  _grow(need) {
+    const req = this.pos + need;
+    if (req <= this.buf.length) return;
+    let ns = this.buf.length;
+    while (ns < req) ns = ns << 1;
+    const nb = new Uint8Array(ns);
+    nb.set(this.buf.subarray(0, this.pos));
+    this.buf = nb;
+    this.dv = new DataView(nb.buffer);
+  }
+
+  // ── Public API ────────────────────────────────────────────────────
+
+  serialize(value) {
+    this.resetState();
+    // Header
+    this._grow(5);
+    this.dv.setUint32(0, MAGIC, true);
+    this.buf[4] = 6;
+    this.pos = 5;
+    if (this.options.detectCircular) this.detectCircularReferences(value, new WeakSet());
+    this.writeValue(value);
+    return this.buf.slice(0, this.pos);
+  }
+
+  deserialize(input) {
+    this.buffer = (input instanceof Uint8Array) ? input : new Uint8Array(input);
+    this.view = new DataView(this.buffer.buffer, this.buffer.byteOffset, this.buffer.byteLength);
+    this.pos = 0;
+    this.deserializeRefs = [];
+    this.deserializeStrings = [];
+    this.deserializeBuffers = [];
+    const magic = this.view.getUint32(0, true);
+    if (magic !== MAGIC) throw new Error("Invalid TurboSerial data");
+    if (this.buffer[4] !== 6) throw new Error(`Unsupported version: ${this.buffer[4]}`);
+    this.pos = 5;
+    return this.readValue();
+  }
+
+  resetState() {
+    this.pos = 0;
+    this.refs.clear();
+    this.circularRefs.clear();
+    this.strings.clear();
+    this.buffers.clear();
+  }
+
+  resetMemory(opts = {}) {
+    const sz = opts.shrink ? Math.max(this.options.memoryPoolSize || 65536, 256) : this.buf.length;
+    this.buf = new Uint8Array(sz);
+    this.dv = new DataView(this.buf.buffer);
+    this.pos = 0;
+    this.refs.clear();
+    this.circularRefs.clear();
+    this.strings.clear();
+    this.buffers.clear();
+    if (this.deserializeRefs) { this.deserializeRefs.length = 0; this.deserializeRefs = null; }
+    if (this.deserializeStrings) { this.deserializeStrings.length = 0; this.deserializeStrings = null; }
+    if (this.deserializeBuffers) { this.deserializeBuffers.length = 0; this.deserializeBuffers = null; }
     return this;
   }
 
-  /**
-   * Detect circular references in value
-   * @param {*} value - Value to check
-   * @param {WeakSet} visited - Visited objects
-   */
+  // ── Circular detection ────────────────────────────────────────────
+
   detectCircularReferences(value, visited) {
-    if (typeof value !== 'object' || value == null) return;
-    
-    if (visited.has(value)) {
-      this.circularRefs.add(value);
-      return;
-    }
-    
+    if (typeof value !== "object" || value === null) return;
+    if (visited.has(value)) { this.circularRefs.add(value); return; }
     visited.add(value);
-    
     try {
       if (Array.isArray(value)) {
-        for (let i = 0; i < value.length; i++) {
-          if (i in value) {
-            this.detectCircularReferences(value[i], visited);
-          }
+        for (let i = 0, l = value.length; i < l; i++) {
+          if (i in value) this.detectCircularReferences(value[i], visited);
         }
       } else if (value instanceof Map) {
-        for (const [k, v] of value) {
-          this.detectCircularReferences(k, visited);
-          this.detectCircularReferences(v, visited);
-        }
+        for (const [k,v] of value) { this.detectCircularReferences(k, visited); this.detectCircularReferences(v, visited); }
       } else if (value instanceof Set) {
-        for (const item of value) {
-          this.detectCircularReferences(item, visited);
-        }
+        for (const item of value) this.detectCircularReferences(item, visited);
       } else {
-        for (const key in value) {
-          if (Object.prototype.hasOwnProperty.call(value, key)) {
-            try {
-              this.detectCircularReferences(value[key], visited);
-            } catch (e) {
-              // Skip inaccessible properties
-            }
-          }
+        const keys = Object.keys(value);
+        for (let i = 0; i < keys.length; i++) {
+          try { this.detectCircularReferences(value[keys[i]], visited); } catch(e) {}
         }
       }
-    } finally {
-      visited.delete(value);
-    }
+    } finally { visited.delete(value); }
   }
 
-  /**
-   * Write value with deduplication and type dispatch
-   * @param {*} value - Value to write
-   */
+  // ── Write: varint ─────────────────────────────────────────────────
+
+  _wV(v) {
+    v = v >>> 0;
+    const b = this.buf;
+    let p = this.pos;
+    if (v < 0x80) { b[p] = v; this.pos = p + 1; return; }
+    if (v < 0x4000) { b[p] = (v & 0x7F) | 0x80; b[p+1] = v >>> 7; this.pos = p + 2; return; }
+    while (v >= 0x80) { b[p++] = (v & 0x7F) | 0x80; v >>>= 7; }
+    b[p++] = v;
+    this.pos = p;
+  }
+
+  // ── Write: main dispatch ──────────────────────────────────────────
+
   writeValue(value) {
-    // Handle circular references
-    if (this.options.detectCircular && typeof value == 'object' && value != null) {
-      if (this.circularRefs.has(value)) {
-        const refId = this.refs.get(value);
-        if (refId !== undefined) {
-          this.pool.writeU8(TYPE.CIRCULAR_REF);
-          this.pool.writeVarint(refId);
-          return;
-        }
-        this.refs.set(value, this.refs.size);
-      }
+    // Inline primitives
+    if (value === null) { this._grow(1); this.buf[this.pos++] = 0x00; return; }
+    if (value === undefined) { this._grow(1); this.buf[this.pos++] = 0x01; return; }
+
+    const tp = typeof value;
+    if (tp === "boolean") { this._grow(1); this.buf[this.pos++] = value ? 0x03 : 0x02; return; }
+    if (tp === "number") { this._wNum(value); return; }
+    if (tp === "string") { this._wStrDedup(value); return; }
+    if (tp === "bigint") { this._wBigInt(value); return; }
+
+    if (tp === "symbol") {
+      this._grow(2);
+      const key = Symbol.keyFor(value);
+      if (key !== undefined) { this.buf[this.pos++] = T.SYMBOL_GLOBAL; this.writeValue(key); }
+      else if (WELLKNOWN_SYMBOLS.has(value)) { this.buf[this.pos++] = T.SYMBOL_WELLKNOWN; this.writeValue(WELLKNOWN_SYMBOLS.get(value)); }
+      else if (value.description === undefined) { this.buf[this.pos++] = T.SYMBOL_NO_DESC; }
+      else { this.buf[this.pos++] = T.SYMBOL; this.writeValue(value.description); }
+      return;
     }
-    
-    // Handle object deduplication
-    if (this.options.deduplication && typeof value == 'object' && value != null && !this.circularRefs.has(value)) {
-      const refId = this.refs.get(value);
-      if (refId !== undefined) {
-        this.pool.writeU8(TYPE.REFERENCE);
-        this.pool.writeVarint(refId);
-        return;
-      }
+
+    if (tp === "function") {
+      this._grow(1);
+      this.buf[this.pos++] = this.options.allowFunction ? T.FUNCTION_PLACEHOLDER : T.UNDEFINED;
+      return;
+    }
+
+    // ── Object path ──
+
+    // Circular ref
+    if (this.options.detectCircular && this.circularRefs.has(value)) {
+      const rid = this.refs.get(value);
+      if (rid !== undefined) { this._grow(6); this.buf[this.pos++] = T.CIRCULAR_REF; this._wV(rid); return; }
       this.refs.set(value, this.refs.size);
     }
-    
-    // Handle string deduplication
-    if (this.options.deduplication && typeof value == 'string' && value.length > 3) {
-      const stringId = this.strings.get(value);
-      if (stringId !== undefined) {
-        this.pool.writeU8(TYPE.STRING_REF);
-        this.pool.writeVarint(stringId);
+    // Object dedup
+    if (this.options.deduplication && !this.circularRefs.has(value)) {
+      const rid = this.refs.get(value);
+      if (rid !== undefined) { this._grow(6); this.buf[this.pos++] = T.REFERENCE; this._wV(rid); return; }
+      this.refs.set(value, this.refs.size);
+    }
+    // ArrayBuffer sharing
+    if (this.options.shareArrayBuffers && value instanceof ArrayBuffer) {
+      const bid = this.buffers.get(value);
+      if (bid !== undefined) { this._grow(6); this.buf[this.pos++] = T.BUFFER_REF; this._wV(bid); return; }
+      this.buffers.set(value, this.buffers.size);
+    }
+
+    this._wObj(value);
+  }
+
+  // ── Write: string with dedup ──────────────────────────────────────
+
+  _wStrDedup(value) {
+    if (this.options.deduplication && value.length > 3) {
+      const sid = this.strings.get(value);
+      if (sid !== undefined) {
+        this._grow(6);
+        this.buf[this.pos++] = T.STRING_REF;
+        this._wV(sid);
         return;
       }
       this.strings.set(value, this.strings.size);
     }
+    this._wStr(value);
+  }
+
+  // ── Write: numbers ────────────────────────────────────────────────
+
+  _wNum(v) {
+    this._grow(10);
     
-    // Handle buffer sharing
-    if (this.options.shareArrayBuffers && value instanceof ArrayBuffer) {
-      const bufferId = this.buffers.get(value);
-      if (bufferId !== undefined) {
-        this.pool.writeU8(TYPE.BUFFER_REF);
-        this.pool.writeVarint(bufferId);
+    let p = this.pos;
+    if (v !== v) { this.buf[p] = T.NAN; this.pos = p+1; return; }
+    if (v === Infinity) { this.buf[p] = T.INFINITY; this.pos = p+1; return; }
+    if (v === -Infinity) { this.buf[p] = T.NEG_INFINITY; this.pos = p+1; return; }
+    if (v === 0 && (1/v) < 0) { this.buf[p] = T.NEG_ZERO; this.pos = p+1; return; }
+    const iv = v | 0;
+    if (v === iv) {
+      if (iv >= -0x80 && iv <= 0x7F) { this.buf[p] = T.INT8; this.buf[p+1] = iv & 0xFF; this.pos = p+2; }
+      else if (iv >= -0x8000 && iv <= 0x7FFF) { this.buf[p] = T.INT16; this.dv.setInt16(p+1, iv, true); this.pos = p+3; }
+      else { this.buf[p] = T.INT32; this.dv.setInt32(p+1, iv, true); this.pos = p+5; }
+      return;
+    }
+    const uv = v >>> 0;
+    if (v === uv) { this.buf[p] = T.UINT32; this.dv.setUint32(p+1, uv, true); this.pos = p+5; return; }
+    _f32[0] = v;
+    if (_f32[0] === v) { this.buf[p] = T.FLOAT32; this.dv.setFloat32(p+1, v, true); this.pos = p+5; }
+    else { this.buf[p] = T.FLOAT64; this.dv.setFloat64(p+1, v, true); this.pos = p+9; }
+  }
+
+  // ── Write: bigint ─────────────────────────────────────────────────
+
+  _wBigInt(v) {
+    this._grow(10);
+    const neg = v < 0n, abs = neg ? -v : v;
+    if (abs <= 0x7FFFFFFFFFFFFFFFn) {
+      this.buf[this.pos++] = neg ? T.BIGINT_NEG_SMALL : T.BIGINT_POS_SMALL;
+      this.dv.setBigInt64(this.pos, v, true);
+      this.pos += 8;
+    } else {
+      this.buf[this.pos++] = neg ? T.BIGINT_NEG_LARGE : T.BIGINT_POS_LARGE;
+      let hex = abs.toString(16);
+      if (hex.length & 1) hex = "0" + hex;
+      const len = hex.length >>> 1;
+      this._grow(len + 5);
+      this._wV(len);
+      for (let i = hex.length - 2; i >= 0; i -= 2) this.buf[this.pos++] = parseInt(hex.substr(i, 2), 16);
+      if (hex.length % 2) this.buf[this.pos++] = parseInt(hex[0], 16);
+    }
+  }
+
+  // ── Write: strings ────────────────────────────────────────────────
+
+  _wStr(value) {
+    const len = value.length;
+
+    if (len === 0) { this._grow(1); this.buf[this.pos++] = T.STRING_EMPTY; return; }
+
+    if (len < 128) {
+      let ascii = 1;
+      for (let i = 0; i < len; i++) { if (value.charCodeAt(i) > 0x7F) { ascii = 0; break; } }
+      if (ascii) {
+        this._grow(len + 2);
+        let p = this.pos;
+        this.buf[p++] = len < 16 ? T.STRING_ASCII_TINY : T.STRING_ASCII_SHORT;
+        this.buf[p++] = len;
+        for (let i = 0; i < len; i++) this.buf[p + i] = value.charCodeAt(i);
+        this.pos = p + len;
         return;
       }
-      this.buffers.set(value, this.buffers.size);
+      const enc = this.enc.encode(value);
+      const bl = enc.length;
+      this._grow(bl + 7);
+      let p = this.pos;
+      this.buf[p++] = bl < 16 ? T.STRING_UTF8_TINY : bl < 256 ? T.STRING_UTF8_SHORT : T.STRING_UTF8_LONG;
+      if (bl < 256) { this.buf[p++] = bl; } else { this.pos = p; this._wV(bl); p = this.pos; }
+      this.buf.set(enc, p);
+      this.pos = p + bl;
+      return;
     }
-    
-    // Detect and write type
-    const type = this.detector.detect(value);
-    this.pool.writeU8(type);
-    
-    // Fast group dispatch using bit manipulation
-    const group = type & TYPE_MASK.GROUP;
-    
-    switch (group) {
-      case TYPE_GROUP.PRIMITIVE:
-        // No additional data needed
-        break;
-      case TYPE_GROUP.NUMBER:
-        this.writeNumber(value, type);
-        break;
-      case TYPE_GROUP.BIGINT:
-        this.writeBigInt(value, type);
-        break;
-      case TYPE_GROUP.STRING:
-        this.writeString(value, type);
-        break;
-      case TYPE_GROUP.ARRAY:
-        this.writeArray(value, type);
-        break;
-      case TYPE_GROUP.OBJECT:
-        this.writeObject(value, type);
-        break;
-      case TYPE_GROUP.TYPED:
-        this.writeTypedArray(value, type);
-        break;
-      case TYPE_GROUP.BUFFER:
-        this.writeArrayBuffer(value, type);
-        break;
-      case TYPE_GROUP.COLLECTION:
-        this.writeCollection(value, type);
-        break;
-      case TYPE_GROUP.DATE:
-        this.writeDate(value, type);
-        break;
-      case TYPE_GROUP.ERROR:
-        this.writeError(value, type);
-        break;
-      case TYPE_GROUP.REGEX:
-        this.writeRegExp(value);
-        break;
-      case TYPE_GROUP.BINARY:
-        this.writeBinary(value, type);
-        break;
-      case TYPE_GROUP.SPECIAL:
-        this.writeSpecial(value, type);
-        break;
-      case TYPE_GROUP.EXTENSION:
-        this.writeExtension(value, type);
-        break;
+
+    const enc = this.enc.encode(value);
+    const bl = enc.length;
+    this._grow(bl + 7);
+    let p = this.pos;
+    if (bl === len) {
+      this.buf[p++] = len < 256 ? T.STRING_ASCII_SHORT : T.STRING_ASCII_LONG;
+      if (len < 256) { this.buf[p++] = len; } else { this.pos = p; this._wV(len); p = this.pos; }
+    } else {
+      this.buf[p++] = bl < 256 ? T.STRING_UTF8_SHORT : T.STRING_UTF8_LONG;
+      if (bl < 256) { this.buf[p++] = bl; } else { this.pos = p; this._wV(bl); p = this.pos; }
     }
+    this.buf.set(enc, p);
+    this.pos = p + bl;
   }
 
-  /**
-   * Write number value
-   * @param {number} value - Number to write
-   * @param {number} type - Number type
-   */
-  writeNumber(value, type) {
-    switch (type) {
-      case TYPE.INT8:
-        this.pool.writeU8(value);
-        break;
-      case TYPE.INT16:
-        this.pool.writeI16(value);
-        break;
-      case TYPE.INT32:
-        this.pool.writeI32(value);
-        break;
-      case TYPE.UINT32:
-        this.pool.writeU32(value);
-        break;
-      case TYPE.FLOAT32:
-        this.pool.writeF32(value);
-        break;
-      case TYPE.FLOAT64:
-        this.pool.writeF64(value);
-        break;
-      case TYPE.VARINT:
-        const isNegative = value < 0;
-        this.pool.writeVarint(Math.abs(value));
-        this.pool.writeU8(isNegative ? 1 : 0);
-        break;
+  // ── Write: objects (dispatch) ─────────────────────────────────────
+
+  _wObj(value) {
+    
+    if (Array.isArray(value)) { this._wArr(value); return; }
+
+    const ctor = value.constructor;
+    const mapped = CTOR_MAP.get(ctor);
+    if (mapped !== undefined) {
+      if (mapped === T.DATE) {
+        this._grow(9); const t = value.getTime();
+        if (t !== t) { this.buf[this.pos++] = T.DATE_INVALID; } else { this.buf[this.pos++] = T.DATE; this.dv.setFloat64(this.pos, t, true); this.pos += 8; }
+        return;
+      }
+      if (mapped === T.REGEXP) { this._grow(1); this.buf[this.pos++] = T.REGEXP; this.writeValue(value.source); this.writeValue(value.flags); return; }
+      if (mapped === T.MAP) { this._grow(6); this.buf[this.pos++] = T.MAP; this._wV(value.size); for (const [k,v] of value) { this.writeValue(k); this.writeValue(v); } return; }
+      if (mapped === T.SET) { this._grow(6); this.buf[this.pos++] = T.SET; this._wV(value.size); for (const item of value) this.writeValue(item); return; }
+      if (mapped === T.ARRAYBUFFER || mapped === T.SHAREDARRAYBUFFER) {
+        this._grow(6); this.buf[this.pos++] = mapped;
+        const bytes = new Uint8Array(value);
+        this._wV(bytes.length);
+        this._grow(bytes.length);
+        this.buf.set(bytes, this.pos);
+        this.pos += bytes.length;
+        return;
+      }
+      if ((mapped & 0xF0) === 0x60) { this._wTypedArr(value, mapped); return; }
     }
+
+    if (value instanceof Error) {
+      this._grow(2);
+      const et = ERR_NAMES.get(value.constructor.name) || T.CUSTOM_ERROR;
+      this.buf[this.pos++] = et;
+      this.writeValue(value.message || "");
+      this.writeValue(value.stack || "");
+      if (et === T.AGGREGATE_ERROR && value.errors) {
+        this._wV(value.errors.length);
+        for (const e of value.errors) this.writeValue(e);
+      }
+      return;
+    }
+
+    if (typeof Blob !== 'undefined' && value instanceof Blob) {
+      this._grow(12); this.buf[this.pos++] = (value instanceof File) ? T.FILE : T.BLOB;
+      this._wV(0); this._wV(0);
+      return;
+    }
+
+    this._wPlainObj(value);
   }
 
-  /**
-   * Write BigInt value
-   * @param {BigInt} value - BigInt to write
-   * @param {number} type - BigInt type
-   */
-  writeBigInt(value, type) {
-    switch (type) {
-      case TYPE.BIGINT_POS_SMALL:
-      case TYPE.BIGINT_NEG_SMALL:
-        this.pool.writeBigInt64(value);
-        break;
-      case TYPE.BIGINT_POS_LARGE:
-      case TYPE.BIGINT_NEG_LARGE:
-        this.writeLargeBigInt(value);
-        break;
+  // ── Write: arrays ─────────────────────────────────────────────────
+
+  _wArr(arr) {
+    const len = arr.length;
+    if (len === 0) { this._grow(1); this.buf[this.pos++] = T.ARRAY_EMPTY; return; }
+    let sparse = false;
+    for (let i = 0; i < len; i++) { if (!(i in arr)) { sparse = true; break; } }
+    if (sparse) {
+      this._grow(12); this.buf[this.pos++] = T.ARRAY_SPARSE; this._wV(len);
+      const entries = [];
+      for (let i = 0; i < len; i++) { if (i in arr) entries.push(i); }
+      this._wV(entries.length);
+      for (const idx of entries) { this._wV(idx); this.writeValue(arr[idx]); }
+      return;
     }
+    if (this.options.simdOptimization && len >= 8 && typeof arr[0] === "number") {
+      const packed = this._detectPacked(arr, len);
+      if (packed) { this._grow(6); this.buf[this.pos++] = packed; this._wPacked(arr, len, packed); return; }
+    }
+    this._grow(6); this.buf[this.pos++] = T.ARRAY_DENSE; this._wV(len);
+    for (let i = 0; i < len; i++) this.writeValue(arr[i]);
   }
 
-  /**
-   * Write large BigInt
-   * @param {BigInt} value - BigInt to write
-   */
-  writeLargeBigInt(value) {
-    const bigintValue = BigInt(value);
-    const hex = bigintValue.toString(16).replace('-', '');
-    const bytes = [];
-    
-    for (let i = hex.length - 2; i >= 0; i -= 2) {
-      bytes.push(parseInt(hex.substr(i, 2), 16));
-    }
-    if (hex.length % 2) {
-      bytes.push(parseInt(hex[0], 16));
-    }
-    
-    this.pool.writeVarint(bytes.length);
-    for (const byte of bytes) {
-      this.pool.writeU8(byte);
-    }
-  }
-
-  /**
-   * Write string value
-   * @param {string} value - String to write
-   * @param {number} type - String type
-   */
-  writeString(value, type) {
-    const len = value.length;
-    
-    switch (type) {
-      case TYPE.STRING_EMPTY:
-        // No data needed
-        break;
-        
-      case TYPE.STRING_ASCII_TINY:
-      case TYPE.STRING_ASCII_SHORT:
-        this.pool.writeU8(len);
-        for (let i = 0; i < len; i++) {
-          this.pool.writeU8(value.charCodeAt(i));
-        }
-        break;
-        
-      case TYPE.STRING_ASCII_LONG:
-        this.pool.writeVarint(len);
-        for (let i = 0; i < len; i++) {
-          this.pool.writeU8(value.charCodeAt(i));
-        }
-        break;
-        
-      case TYPE.STRING_UTF8_TINY:
-      case TYPE.STRING_UTF8_SHORT:
-      case TYPE.STRING_UTF8_LONG:
-        const encoded = this.encoder.encode(value);
-        if (type == TYPE.STRING_UTF8_TINY || type == TYPE.STRING_UTF8_SHORT) {
-          this.pool.writeU8(encoded.length);
-        } else {
-          this.pool.writeVarint(encoded.length);
-        }
-        this.pool.writeBulkAligned(encoded, 1);
-        break;
-    }
-  }
-
-  /**
-   * Write array value
-   * @param {Array} value - Array to write
-   * @param {number} type - Array type
-   */
-  writeArray(value, type) {
-    const len = value.length;
-    
-    switch (type) {
-      case TYPE.ARRAY_EMPTY:
-        // No data needed
-        break;
-        
-      case TYPE.ARRAY_DENSE:
-        this.pool.writeVarint(len);
-        for (let i = 0; i < len; i++) {
-          this.writeValue(value[i]);
-        }
-        break;
-        
-      case TYPE.ARRAY_SPARSE:
-        this.writeSparseArray(value);
-        break;
-        
-      case TYPE.ARRAY_PACKED_I8:
-      case TYPE.ARRAY_PACKED_I16:
-      case TYPE.ARRAY_PACKED_I32:
-      case TYPE.ARRAY_PACKED_F32:
-      case TYPE.ARRAY_PACKED_F64:
-        this.pool.writePackedArray(value, type);
-        break;
-    }
-  }
-
-  /**
-   * Write sparse array with optimized indexing
-   * @param {Array} array - Sparse array to write
-   */
-  writeSparseArray(array) {
-    const len = array.length;
-    
-    // Use typed array for indices
-    const indices = new Uint32Array(len);
-    const values = [];
-    let count = 0;
-    
+  _detectPacked(arr, len) {
+    let allInt = 1, min = arr[0], max = arr[0], canF32 = 1;
     for (let i = 0; i < len; i++) {
-      if (i in array) {
-        indices[count] = i;
-        values[count] = array[i];
-        count++;
-      }
+      const v = arr[i];
+      if (typeof v !== "number") return 0;
+      if (v !== (v | 0)) allInt = 0;
+      if (v < min) min = v; if (v > max) max = v;
+      if (canF32) { _f32[0] = v; if (_f32[0] !== v) canF32 = 0; }
     }
-    
-    this.pool.writeVarint(len);
-    this.pool.writeVarint(count);
-    
-    for (let i = 0; i < count; i++) {
-      this.pool.writeVarint(indices[i]);
-      this.writeValue(values[i]);
+    if (allInt) {
+      const am = Math.max(Math.abs(min), Math.abs(max));
+      if (am <= 0x7F) return T.ARRAY_PACKED_I8;
+      if (am <= 0x7FFF) return T.ARRAY_PACKED_I16;
+      return T.ARRAY_PACKED_I32;
     }
+    return canF32 ? T.ARRAY_PACKED_F32 : T.ARRAY_PACKED_F64;
   }
 
-  /**
-   * FIXED: Write object value with enhanced property handling
-   * @param {Object} value - Object to write
-   * @param {number} type - Object type
-   */
-  writeObject(value, type) {
-    if (type == TYPE.OBJECT_EMPTY) {
-      return;
-    }
-    
+  _wPacked(arr, len, type) {
+    const dv = this.dv;
+    this._wV(len);
+    const es = BPE[type] || 1;
+    this._grow(len * es);
+    let p = this.pos;
     switch (type) {
-      case TYPE.OBJECT_LITERAL:
-      case TYPE.OBJECT_PLAIN:
-        this.writeSimpleObject(value);
-        break;
-      case TYPE.OBJECT_WITH_DESCRIPTORS:
-        this.writeObjectWithDescriptors(value);
-        break;
-      case TYPE.OBJECT_WITH_METHODS:
-        this.writeObjectWithMethods(value);
-        break;
-      case TYPE.OBJECT_CONSTRUCTOR:
-        this.writeConstructorObject(value);
-        break;
+      case T.ARRAY_PACKED_I8:  for (let i = 0; i < len; i++) this.buf[p++] = arr[i] & 0xFF; break;
+      case T.ARRAY_PACKED_I16: for (let i = 0; i < len; i++) { this.dv.setInt16(p, arr[i], true); p += 2; } break;
+      case T.ARRAY_PACKED_I32: for (let i = 0; i < len; i++) { this.dv.setInt32(p, arr[i], true); p += 4; } break;
+      case T.ARRAY_PACKED_F32: for (let i = 0; i < len; i++) { this.dv.setFloat32(p, arr[i], true); p += 4; } break;
+      case T.ARRAY_PACKED_F64: for (let i = 0; i < len; i++) { this.dv.setFloat64(p, arr[i], true); p += 8; } break;
     }
+    this.pos = p;
   }
 
-  /**
-   * NEW: Write simple object with basic properties
-   * @param {Object} obj - Object to write
-   */
-  writeSimpleObject(obj) {
-    const keys = Object.keys(obj);
-    
-    // Fast path: when allowFunction is false (default), skip filter entirely
-    if (!this.options.serializeFunctions) {
-      // Direct iteration — no filter, no sort allocation
-      let count = 0;
-      for (let i = 0; i < keys.length; i++) {
-        try { if (typeof obj[keys[i]] !== 'function') count++; } catch(e) { /* skip */ }
-      }
-      this.pool.writeVarint(count);
-      
-      if (this.options.sortKeys) keys.sort();
-      for (let i = 0; i < keys.length; i++) {
-        const key = keys[i];
-        try {
-          const val = obj[key];
-          if (typeof val !== 'function') {
-            this.writeValue(key);
-            this.writeValue(val);
-          }
-        } catch(e) { /* skip inaccessible */ }
-      }
-      return;
-    }
-    
-    // Slow path: serializeFunctions enabled
-    const serializableKeys = keys.filter(key => {
-      try {
-        const val = obj[key];
-        return typeof val !== 'function' || this.options.serializeFunctions;
-      } catch (e) {
-        return false;
-      }
-    });
-    
-    if (this.options.sortKeys) serializableKeys.sort();
-    this.pool.writeVarint(serializableKeys.length);
-    
-    for (const key of serializableKeys) {
-      this.writeValue(key);
-      this.writeValue(obj[key]);
-    }
-  }
+  // ── Write: typed arrays ───────────────────────────────────────────
 
-  /**
-   * NEW: Write object with complex property descriptors
-   * @param {Object} obj - Object to write
-   */
-  writeObjectWithDescriptors(obj) {
-    const ownKeys = Object.getOwnPropertyNames(obj);
-    const ownSymbols = Object.getOwnPropertySymbols(obj);
-    const allKeys = [...ownKeys, ...ownSymbols];
-    
-    const serializableKeys = allKeys.filter(key => {
-      try {
-        const descriptor = Object.getOwnPropertyDescriptor(obj, key);
-        return descriptor && (
-          this.options.serializeFunctions || 
-          (!descriptor.get && !descriptor.set && typeof descriptor.value !== 'function')
-        );
-      } catch (e) {
-        return false;
-      }
-    });
-    
-    this.pool.writeVarint(serializableKeys.length);
-    
-    for (const key of serializableKeys) {
-      this.writeValue(key);
-      
-      const descriptor = Object.getOwnPropertyDescriptor(obj, key);
-      
-      // Write descriptor flags
-      let flags = 0;
-      if (descriptor.enumerable) flags |= 1;
-      if (descriptor.writable) flags |= 2;
-      if (descriptor.configurable) flags |= 4;
-      if (descriptor.get) flags |= 8;
-      if (descriptor.set) flags |= 16;
-      
-      this.pool.writeU8(flags);
-      
-      // Write getter/setter or value
-      if (descriptor.get || descriptor.set) {
-        if (descriptor.get) this.writeValue(descriptor.get);
-        if (descriptor.set) this.writeValue(descriptor.set);
-      } else {
-        this.writeValue(descriptor.value);
-      }
-    }
-  }
-
-  /**
-   * NEW: Write object with methods
-   * @param {Object} obj - Object to write
-   */
-  writeObjectWithMethods(obj) {
-    const keys = Object.keys(obj);
-    const serializableEntries = [];
-    
-    for (const key of keys) {
-      try {
-        const value = obj[key];
-        if (typeof value === 'function') {
-          if (this.options.serializeFunctions) {
-            serializableEntries.push([key, value, true]); // true = is function
-          } else {
-            serializableEntries.push([key, null, false]); // placeholder
-          }
-        } else {
-          serializableEntries.push([key, value, false]);
-        }
-      } catch (e) {
-        // Skip inaccessible properties
-      }
-    }
-    
-    this.pool.writeVarint(serializableEntries.length);
-    
-    for (const [key, value, isFunction] of serializableEntries) {
-      this.writeValue(key);
-      this.pool.writeU8(isFunction ? 1 : 0);
-      
-      if (isFunction && this.options.serializeFunctions) {
-        // Serialize function source
-        this.writeValue(value.toString());
-        this.writeValue(value.name || '');
-      } else if (!isFunction) {
-        this.writeValue(value);
-      } else {
-        // Write placeholder marker
-        this.pool.writeU8(TYPE.FUNCTION_PLACEHOLDER);
-      }
-    }
-  }
-
-  /**
-   * NEW: Write constructor-based object
-   * @param {Object} obj - Object to write
-   */
-  writeConstructorObject(obj) {
-    // Write constructor name
-    this.writeValue(obj.constructor.name || '');
-    
-    // Write enumerable properties
-    const keys = Object.keys(obj);
-    const serializableKeys = keys.filter(key => {
-      try {
-        return typeof obj[key] !== 'function' || this.options.serializeFunctions;
-      } catch (e) {
-        return false;
-      }
-    });
-    
-    this.pool.writeVarint(serializableKeys.length);
-    
-    for (const key of serializableKeys) {
-      this.writeValue(key);
-      this.writeValue(obj[key]);
-    }
-  }
-
-  /**
-   * Write typed array value
-   * @param {TypedArray} array - Typed array to write
-   * @param {number} type - Typed array type
-   */
-  writeTypedArray(array, type) {
-    const buffer = array.buffer;
-    const byteOffset = array.byteOffset;
-    const length = array.length;
-    
-    // Check for shared buffer
+  _wTypedArr(arr, type) {
+    this._grow(12);
+    this.buf[this.pos++] = type;
+    const buffer = arr.buffer;
     if (this.options.shareArrayBuffers) {
-      const bufferId = this.buffers.get(buffer);
-      if (bufferId !== undefined) {
-        this.pool.writeU8(1); // Shared flag
-        this.pool.writeVarint(bufferId);
-        this.pool.writeVarint(byteOffset);
-        this.pool.writeVarint(length);
+      const bid = this.buffers.get(buffer);
+      if (bid !== undefined) {
+        this.buf[this.pos++] = 1; // shared flag
+        this._wV(bid); this._wV(arr.byteOffset); this._wV(arr.length);
         return;
       }
       this.buffers.set(buffer, this.buffers.size);
     }
-    
-    this.pool.writeU8(0); // Not shared
-    this.pool.writeVarint(byteOffset);
-    this.pool.writeVarint(length);
-    
-    const elementSize = BYTES_PER_ELEMENT[type] || 1;
-    const totalBytes = length * elementSize;
-    
-    // Special handling for BigInt arrays
-    if (type == TYPE.BIGINT64ARRAY || type == TYPE.BIGUINT64ARRAY) {
-      for (let i = 0; i < length; i++) {
-        this.pool.writeBigInt64(array[i]);
-      }
+    this.buf[this.pos++] = 0; // not shared
+    this._wV(arr.byteOffset); this._wV(arr.length);
+    const es = BPE[type] || 1;
+    if (type === T.BIGINT64ARRAY || type === T.BIGUINT64ARRAY) {
+      this._grow(arr.length * 8);
+      for (let i = 0; i < arr.length; i++) { this.dv.setBigInt64(this.pos, arr[i], true); this.pos += 8; }
     } else {
-      const sourceData = new Uint8Array(buffer, byteOffset, totalBytes);
-      this.pool.writeBulkAligned(sourceData, elementSize);
+      const tb = arr.length * es;
+      this._grow(tb);
+      const src = new Uint8Array(buffer, arr.byteOffset, tb);
+      this.buf.set(src, this.pos);
+      this.pos += tb;
     }
   }
 
-  /**
-   * Write ArrayBuffer value
-   * @param {ArrayBuffer} buffer - Buffer to write
-   * @param {number} type - Buffer type
-   */
-  writeArrayBuffer(buffer, type) {
-    const bytes = new Uint8Array(buffer);
-    this.pool.writeVarint(bytes.length);
-    this.pool.writeBulkAligned(bytes, 1);
-  }
+  // ── Write: plain objects ──────────────────────────────────────────
 
-  /**
-   * Write collection value
-   * @param {Map|Set} value - Collection to write
-   * @param {number} type - Collection type
-   */
-  writeCollection(value, type) {
-    switch (type) {
-      case TYPE.MAP:
-        this.pool.writeVarint(value.size);
-        for (const [key, val] of value) {
-          this.writeValue(key);
-          this.writeValue(val);
-        }
-        break;
-        
-      case TYPE.SET:
-        this.pool.writeVarint(value.size);
-        for (const item of value) {
-          this.writeValue(item);
-        }
-        break;
-    }
-  }
+  _wPlainObj(obj) {
+    const proto = Object.getPrototypeOf(obj);
+    const isPlain = (obj.constructor === Object) || (proto === Object.prototype) || (proto === null);
+    const keys = Object.keys(obj);
 
-  /**
-   * Write Date value
-   * @param {Date} value - Date to write
-   * @param {number} type - Date type
-   */
-  writeDate(value, type) {
-    if (type == TYPE.DATE) {
-      this.pool.writeF64(value.getTime());
-    }
-  }
+    if (keys.length === 0 && isPlain) { this._grow(1); this.buf[this.pos++] = T.OBJECT_EMPTY; return; }
 
-  /**
-   * Write Error value
-   * @param {Error} error - Error to write
-   * @param {number} type - Error type
-   */
-  writeError(error, type) {
-    this.writeValue(error.message || '');
-    this.writeValue(error.stack || '');
-    
-    if (type == TYPE.AGGREGATE_ERROR && error.errors) {
-      this.pool.writeVarint(error.errors.length);
-      for (const subError of error.errors) {
-        this.writeValue(subError);
-      }
-    }
-  }
-
-  /**
-   * Write RegExp value
-   * @param {RegExp} regex - RegExp to write
-   */
-  writeRegExp(regex) {
-    this.writeValue(regex.source);
-    this.writeValue(regex.flags);
-  }
-
-  /**
-   * Write binary value
-   * @param {Blob|File} value - Binary value to write
-   * @param {number} type - Binary type
-   */
-  writeBinary(value, type) {
-    // Simplified for now
-    this.pool.writeVarint(0);
-    this.pool.writeVarint(0);
-  }
-
-  /**
-   * FIXED: Write special value with proper symbol handling
-   * @param {Symbol} value - Special value to write
-   * @param {number} type - Special type
-   */
-  writeSpecial(value, type) {
-    switch (type) {
-      case TYPE.SYMBOL:
-        // Symbol with description (including empty string)
-        const desc = value.description;
-        this.writeValue(desc);
-        break;
-      case TYPE.SYMBOL_NO_DESC:
-        // Symbol without description - no data needed
-        break;
-      case TYPE.SYMBOL_GLOBAL:
-        const key = Symbol.keyFor(value);
-        this.writeValue(key || '');
-        break;
-      case TYPE.SYMBOL_WELLKNOWN:
-        const wellKnownName = WELLKNOWN_SYMBOLS.get(value);
-        this.writeValue(wellKnownName || '');
-        break;
-    }
-  }
-
-  /**
-   * NEW: Write extension value (functions, etc.)
-   * @param {*} value - Extension value to write
-   * @param {number} type - Extension type
-   */
-  writeExtension(value, type) {
-    switch (type) {
-      case TYPE.FUNCTION_PLACEHOLDER:
-        // Just a marker, no data needed
-        break;
-    }
-  }
-
-  /**
-   * Deserialize binary data to value
-   * @param {ArrayBuffer|Uint8Array} buffer - Data to deserialize
-   * @returns {*} Deserialized value
-   */
-  deserialize(buffer) {
-    this.buffer = new Uint8Array(buffer);
-    this.view = new DataView(this.buffer.buffer, this.buffer.byteOffset);
-    this.pos = 0;
-    
-    // Deserialization state
-    this.deserializeRefs = [];
-    this.deserializeStrings = [];
-    this.deserializeBuffers = [];
-    
-    // Validate header
-    const magic = this.readU32();
-    if (magic !== 0x54425235) {
-      throw new Error('Invalid TurboSerial data');
-    }
-    
-    const version = this.readU8();
-    if (version !== 5) {
-      throw new Error(`Unsupported version: ${version}`);
-    }
-    
-    return this.readValue();
-  }
-
-  /**
-   * Read value with type dispatch
-   * @returns {*} Read value
-   */
-  readValue() {
-    if (this.pos >= this.buffer.length) {
-      throw new Error('Unexpected end of buffer');
-    }
-    
-    const type = this.readU8();
-    
-    // Handle references first
-    if (type == TYPE.REFERENCE || type == TYPE.CIRCULAR_REF) {
-      const refId = this.readVarint();
-      if (refId >= this.deserializeRefs.length) {
-        throw new Error(`Invalid reference: ${refId}`);
-      }
-      return this.deserializeRefs[refId];
-    }
-    
-    if (type == TYPE.STRING_REF) {
-      const stringId = this.readVarint();
-      if (stringId >= this.deserializeStrings.length) {
-        throw new Error(`Invalid string reference: ${stringId}`);
-      }
-      return this.deserializeStrings[stringId];
-    }
-    
-    if (type == TYPE.BUFFER_REF) {
-      const bufferId = this.readVarint();
-      if (bufferId >= this.deserializeBuffers.length) {
-        throw new Error(`Invalid buffer reference: ${bufferId}`);
-      }
-      return this.deserializeBuffers[bufferId];
-    }
-    
-    const group = type & TYPE_MASK.GROUP;
-    
-    // Pre-register objects for circular references
-    let value;
-    let needsEarlyRegistration = false;
-    
-    switch (group) {
-      case TYPE_GROUP.OBJECT:
-      case TYPE_GROUP.ARRAY:
-      case TYPE_GROUP.COLLECTION:
-        needsEarlyRegistration = true;
-        break;
-    }
-    
-    if (needsEarlyRegistration) {
-      // Create placeholder
-      switch (group) {
-        case TYPE_GROUP.ARRAY:
-          value = [];
-          break;
-        case TYPE_GROUP.COLLECTION:
-          if (type == TYPE.MAP) {
-            value = new Map();
-          } else if (type == TYPE.SET) {
-            value = new Set();
-          }
-          break;
-        case TYPE_GROUP.OBJECT:
-          value = {};
-          break;
-      }
-      
-      if (value) {
-        this.deserializeRefs.push(value);
-      }
-      
-      // Fill contents
-      switch (group) {
-        case TYPE_GROUP.ARRAY:
-          this.fillArray(value, type);
-          break;
-        case TYPE_GROUP.OBJECT:
-          this.fillObject(value, type);
-          break;
-        case TYPE_GROUP.COLLECTION:
-          this.fillCollection(value, type);
-          break;
-      }
-    } else {
-      // Read normally
-      switch (group) {
-        case TYPE_GROUP.PRIMITIVE:
-          value = this.readPrimitive(type);
-          break;
-        case TYPE_GROUP.NUMBER:
-          value = this.readNumber(type);
-          break;
-        case TYPE_GROUP.BIGINT:
-          value = this.readBigInt(type);
-          break;
-        case TYPE_GROUP.STRING:
-          value = this.readString(type);
-          break;
-        case TYPE_GROUP.TYPED:
-          value = this.readTypedArray(type);
-          break;
-        case TYPE_GROUP.BUFFER:
-          value = this.readArrayBuffer(type);
-          break;
-        case TYPE_GROUP.DATE:
-          value = this.readDate(type);
-          break;
-        case TYPE_GROUP.ERROR:
-          value = this.readError(type);
-          break;
-        case TYPE_GROUP.REGEX:
-          value = this.readRegExp();
-          break;
-        case TYPE_GROUP.BINARY:
-          value = this.readBinary(type);
-          break;
-        case TYPE_GROUP.SPECIAL:
-          value = this.readSpecial(type);
-          break;
-        case TYPE_GROUP.EXTENSION:
-          value = this.readExtension(type);
-          break;
-        default:
-          throw new Error(`Unknown type: 0x${type.toString(16)}`);
-      }
-      
-      // Store reference
-      if (typeof value == 'object' && value != null && !needsEarlyRegistration) {
-        this.deserializeRefs.push(value);
-      }
-    }
-    
-    return value;
-  }
-
-  /**
-   * Fill array with contents
-   * @param {Array} array - Array to fill
-   * @param {number} type - Array type
-   */
-  fillArray(array, type) {
-    switch (type) {
-      case TYPE.ARRAY_EMPTY:
-        break;
-      case TYPE.ARRAY_DENSE:
-        const length = this.readVarint();
-        for (let i = 0; i < length; i++) {
-          array[i] = this.readValue();
-        }
-        break;
-      case TYPE.ARRAY_SPARSE:
-        const totalLength = this.readVarint();
-        const elementCount = this.readVarint();
-        array.length = totalLength;
-        for (let i = 0; i < elementCount; i++) {
-          const index = this.readVarint();
-          array[index] = this.readValue();
-        }
-        break;
-      case TYPE.ARRAY_PACKED_I8:
-      case TYPE.ARRAY_PACKED_I16:
-      case TYPE.ARRAY_PACKED_I32:
-      case TYPE.ARRAY_PACKED_F32:
-      case TYPE.ARRAY_PACKED_F64:
-        const packedArray = this.readPackedArrayData(type);
-        array.push(...packedArray);
-        break;
-    }
-  }
-
-  /**
-   * FIXED: Fill object with enhanced property handling
-   * @param {Object} obj - Object to fill
-   * @param {number} type - Object type
-   */
-  fillObject(obj, type) {
-    if (type == TYPE.OBJECT_EMPTY) {
+    // Classify object type
+    if (!isPlain) {
+      this._wConstructorObj(obj, keys);
       return;
     }
-    
-    switch (type) {
-      case TYPE.OBJECT_LITERAL:
-      case TYPE.OBJECT_PLAIN:
-        this.fillSimpleObject(obj);
-        break;
-      case TYPE.OBJECT_WITH_DESCRIPTORS:
-        this.fillObjectWithDescriptors(obj);
-        break;
-      case TYPE.OBJECT_WITH_METHODS:
-        this.fillObjectWithMethods(obj);
-        break;
-      case TYPE.OBJECT_CONSTRUCTOR:
-        this.fillConstructorObject(obj);
-        break;
-    }
-  }
 
-  /**
-   * NEW: Fill simple object
-   * @param {Object} obj - Object to fill
-   */
-  fillSimpleObject(obj) {
-    const keyCount = this.readVarint();
-    for (let i = 0; i < keyCount; i++) {
-      const key = this.readValue();
-      obj[key] = this.readValue();
-    }
-  }
-
-  /**
-   * NEW: Fill object with descriptors
-   * @param {Object} obj - Object to fill
-   */
-  fillObjectWithDescriptors(obj) {
-    const keyCount = this.readVarint();
-    
-    for (let i = 0; i < keyCount; i++) {
-      const key = this.readValue();
-      const flags = this.readU8();
-      
-      const descriptor = {
-        enumerable: !!(flags & 1),
-        writable: !!(flags & 2),
-        configurable: !!(flags & 4)
-      };
-      
-      const hasGetter = !!(flags & 8);
-      const hasSetter = !!(flags & 16);
-      
-      if (hasGetter || hasSetter) {
-        if (hasGetter) descriptor.get = this.readValue();
-        if (hasSetter) descriptor.set = this.readValue();
-      } else {
-        descriptor.value = this.readValue();
+    if (this.options.preservePropertyDescriptors) {
+      // Check for complex descriptors
+      const allKeys = [...Object.getOwnPropertyNames(obj), ...Object.getOwnPropertySymbols(obj)];
+      let hasComplex = false;
+      for (const k of allKeys) {
+        const d = Object.getOwnPropertyDescriptor(obj, k);
+        if (d.get || d.set || !d.enumerable || !d.writable || !d.configurable) { hasComplex = true; break; }
       }
-      
-      Object.defineProperty(obj, key, descriptor);
+      if (hasComplex) { this._wDescriptorObj(obj, allKeys); return; }
     }
-  }
 
-  /**
-   * NEW: Fill object with methods
-   * @param {Object} obj - Object to fill
-   */
-  fillObjectWithMethods(obj) {
-    const entryCount = this.readVarint();
-    
-    for (let i = 0; i < entryCount; i++) {
-      const key = this.readValue();
-      const isFunction = this.readU8();
-      
-      if (isFunction) {
-        if (this.options.allowFunction && this.options.serializeFunctions) {
-          const functionSource = this.readValue();
-          const functionName = this.readValue();
-          try {
-            // Reconstruct function (requires allowFunction: true)
-            obj[key] = new Function('return ' + functionSource)();
-          } catch (e) {
-            // Fall back to placeholder
-            obj[key] = function() { throw new Error('Function deserialization failed'); };
-          }
-        } else if (this.options.serializeFunctions) {
-          // serializeFunctions is true but allowFunction is false — read past the data but don't eval
-          const functionSource = this.readValue();
-          const functionName = this.readValue();
-          obj[key] = undefined;
-        } else {
-          // Check for placeholder
-          const placeholderType = this.readU8();
-          if (placeholderType === TYPE.FUNCTION_PLACEHOLDER) {
-            // When allowFunction is false, store undefined instead of a function
-            obj[key] = this.options.allowFunction
-              ? function() { throw new Error('Function not serialized'); }
-              : undefined;
-          }
-        }
-      } else {
-        obj[key] = this.readValue();
+    // Check for methods
+    let hasMethods = false;
+    if (this.options.allowFunction) {
+      for (let i = 0; i < keys.length; i++) {
+        if (typeof obj[keys[i]] === "function") { hasMethods = true; break; }
       }
     }
+    if (hasMethods) { this._wMethodObj(obj, keys); return; }
+
+    // Simple object
+    this._grow(6);
+    this.buf[this.pos++] = T.OBJECT_LITERAL;
+    if (this.options.sortKeys) keys.sort();
+    // Count non-function keys
+    let count = keys.length;
+    if (!this.options.serializeFunctions) {
+      count = 0;
+      for (let i = 0; i < keys.length; i++) { if (typeof obj[keys[i]] !== "function") count++; }
+    }
+    this._wV(count);
+    for (let i = 0; i < keys.length; i++) {
+      const v = obj[keys[i]];
+      if (!this.options.serializeFunctions && typeof v === "function") continue;
+      this.writeValue(keys[i]);
+      this.writeValue(v);
+    }
   }
 
-  /**
-   * NEW: Fill constructor object
-   * @param {Object} obj - Object to fill
-   */
-  fillConstructorObject(obj) {
-    const constructorName = this.readValue();
-    const keyCount = this.readVarint();
-    
-    for (let i = 0; i < keyCount; i++) {
-      const key = this.readValue();
-      obj[key] = this.readValue();
-    }
-    
-    // Store constructor name as non-enumerable property
-    Object.defineProperty(obj, '__constructorName', {
-      value: constructorName,
-      enumerable: false,
-      writable: false,
-      configurable: true
+  _wDescriptorObj(obj, allKeys) {
+    this._grow(6);
+    this.buf[this.pos++] = T.OBJECT_WITH_DESCRIPTORS;
+    const serializable = allKeys.filter(k => {
+      try {
+        const d = Object.getOwnPropertyDescriptor(obj, k);
+        return d && (this.options.serializeFunctions || (!d.get && !d.set && typeof d.value !== "function"));
+      } catch(e) { return false; }
     });
-  }
-
-  /**
-   * Fill collection with contents
-   * @param {Map|Set} collection - Collection to fill
-   * @param {number} type - Collection type
-   */
-  fillCollection(collection, type) {
-    const size = this.readVarint();
-    
-    switch (type) {
-      case TYPE.MAP:
-        for (let i = 0; i < size; i++) {
-          const key = this.readValue();
-          const value = this.readValue();
-          collection.set(key, value);
-        }
-        break;
-        
-      case TYPE.SET:
-        for (let i = 0; i < size; i++) {
-          collection.add(this.readValue());
-        }
-        break;
+    this._wV(serializable.length);
+    for (const key of serializable) {
+      this.writeValue(key);
+      const d = Object.getOwnPropertyDescriptor(obj, key);
+      let flags = 0;
+      if (d.enumerable) flags |= 1; if (d.writable) flags |= 2; if (d.configurable) flags |= 4;
+      if (d.get) flags |= 8; if (d.set) flags |= 16;
+      this._grow(1); this.buf[this.pos++] = flags;
+      if (d.get || d.set) { if (d.get) this.writeValue(d.get); if (d.set) this.writeValue(d.set); }
+      else this.writeValue(d.value);
     }
   }
 
-  /**
-   * Read primitive value
-   * @param {number} type - Primitive type
-   * @returns {*} Primitive value
-   */
-  readPrimitive(type) {
-    switch (type) {
-      case TYPE.NULL: return null;
-      case TYPE.UNDEFINED: return undefined;
-      case TYPE.FALSE: return false;
-      case TYPE.TRUE: return true;
-      default:
-        throw new Error(`Unknown primitive: 0x${type.toString(16)}`);
+  _wMethodObj(obj, keys) {
+    this._grow(6);
+    this.buf[this.pos++] = T.OBJECT_WITH_METHODS;
+    const entries = [];
+    for (const k of keys) {
+      try {
+        const v = obj[k];
+        entries.push([k, v, typeof v === "function"]);
+      } catch(e) {}
     }
-  }
-
-  /**
-   * Read number value
-   * @param {number} type - Number type
-   * @returns {number} Number value
-   */
-  readNumber(type) {
-    switch (type) {
-      case TYPE.INT8:
-        return this.view.getInt8(this.pos++);
-      case TYPE.INT16:
-        return this.readI16();
-      case TYPE.INT32:
-        return this.readI32();
-      case TYPE.UINT32:
-        return this.readU32();
-      case TYPE.FLOAT32:
-        return this.readF32();
-      case TYPE.FLOAT64:
-        return this.readF64();
-      case TYPE.NAN:
-        return NaN;
-      case TYPE.INFINITY:
-        return Infinity;
-      case TYPE.NEG_INFINITY:
-        return -Infinity;
-      case TYPE.NEG_ZERO:
-        return -0;
-      case TYPE.VARINT:
-        const value = this.readVarint();
-        const isNegative = this.readU8();
-        return isNegative ? -value : value;
-      default:
-        throw new Error(`Unknown number type: 0x${type.toString(16)}`);
-    }
-  }
-
-  /**
-   * Read BigInt value
-   * @param {number} type - BigInt type
-   * @returns {BigInt} BigInt value
-   */
-  readBigInt(type) {
-    switch (type) {
-      case TYPE.BIGINT_POS_SMALL:
-      case TYPE.BIGINT_NEG_SMALL:
-        return this.readBigInt64();
-      case TYPE.BIGINT_POS_LARGE:
-      case TYPE.BIGINT_NEG_LARGE:
-        return this.readLargeBigInt(type == TYPE.BIGINT_NEG_LARGE);
-      default:
-        throw new Error(`Unknown BigInt type: 0x${type.toString(16)}`);
-    }
-  }
-
-  /**
-   * Read large BigInt
-   * @param {boolean} isNegative - Whether negative
-   * @returns {BigInt} BigInt value
-   */
-  readLargeBigInt(isNegative) {
-    const byteLength = this.readVarint();
-    this.ensureBytes(byteLength);
-    
-    const bytes = this.buffer.subarray(this.pos, this.pos + byteLength);
-    this.pos += byteLength;
-    
-    let hex = '';
-    for (let i = bytes.length - 1; i >= 0; i--) {
-      hex += bytes[i].toString(16).padStart(2, '0');
-    }
-    
-    const value = BigInt('0x' + hex);
-    return isNegative ? -value : value;
-  }
-
-  /**
-   * Read string value
-   * @param {number} type - String type
-   * @returns {string} String value
-   */
-  readString(type) {
-    if (type == TYPE.STRING_EMPTY) {
-      return '';
-    }
-    
-    let length;
-    let str;
-    
-    switch (type) {
-      case TYPE.STRING_ASCII_TINY:
-      case TYPE.STRING_ASCII_SHORT:
-      case TYPE.STRING_UTF8_TINY:
-      case TYPE.STRING_UTF8_SHORT:
-        length = this.readU8();
-        break;
-      default:
-        length = this.readVarint();
-        break;
-    }
-    
-    this.ensureBytes(length);
-    
-    if (type == TYPE.STRING_ASCII_TINY || type == TYPE.STRING_ASCII_SHORT || type == TYPE.STRING_ASCII_LONG) {
-      // ASCII string
-      str = '';
-      for (let i = 0; i < length; i++) {
-        str += String.fromCharCode(this.readU8());
+    this._wV(entries.length);
+    for (const [k, v, isFunc] of entries) {
+      this.writeValue(k);
+      this._grow(1); this.buf[this.pos++] = isFunc ? 1 : 0;
+      if (isFunc && this.options.serializeFunctions) {
+        this.writeValue(v.toString());
+        this.writeValue(v.name || "");
+      } else if (!isFunc) {
+        this.writeValue(v);
+      } else {
+        this._grow(1); this.buf[this.pos++] = T.FUNCTION_PLACEHOLDER;
       }
-    } else {
-      // UTF-8 string
-      const bytes = this.buffer.subarray(this.pos, this.pos + length);
-      this.pos += length;
-      str = this.decoder.decode(bytes);
     }
-    
-    this.deserializeStrings.push(str);
+  }
+
+  _wConstructorObj(obj, keys) {
+    this._grow(6);
+    this.buf[this.pos++] = T.OBJECT_CONSTRUCTOR;
+    this.writeValue(obj.constructor?.name || "");
+    const sk = this.options.serializeFunctions
+      ? keys
+      : keys.filter(k => { try { return typeof obj[k] !== "function"; } catch(e) { return false; } });
+    this._wV(sk.length);
+    for (const k of sk) { this.writeValue(k); this.writeValue(obj[k]); }
+  }
+
+  // ══════════════════════════════════════════════════════════════════
+  // ── DESERIALIZATION ───────────────────────────────────────────────
+  // ══════════════════════════════════════════════════════════════════
+
+  readValue() {
+    const b = this.buffer;
+    const type = this.buf[this.pos++];
+
+    // References
+    if (type === T.REFERENCE || type === T.CIRCULAR_REF) return this.deserializeRefs[this._rV()];
+    if (type === T.STRING_REF) return this.deserializeStrings[this._rV()];
+    if (type === T.BUFFER_REF) return this.deserializeBuffers[this._rV()];
+
+    const g = type & GM;
+
+    // Primitives
+    if (g === 0x00) { return type === 0x00 ? null : type === 0x01 ? undefined : type === 0x03; }
+    // Numbers
+    if (g === 0x10) return this._rNum(type);
+    // BigInt
+    if (g === 0x20) return this._rBigInt(type);
+    // String
+    if (g === 0x30) return this._rStr(type);
+
+    // Array / Object / Collection — register BEFORE filling
+    if (g === 0x40 || g === 0x50 || g === 0x80) {
+      let val;
+      if (g === 0x40) val = [];
+      else if (g === 0x80) val = type === T.MAP ? new Map() : new Set();
+      else val = {};
+      this.deserializeRefs.push(val);
+      this._rFill(val, type, g);
+      return val;
+    }
+
+    // Typed arrays (0x60)
+    if (g === 0x60) { const v = this._rTypedArr(type); this.deserializeRefs.push(v); return v; }
+    // Buffers (0x70)
+    if (g === 0x70) { const v = this._rArrayBuf(type); this.deserializeBuffers.push(v); return v; }
+    // Date (0x90)
+    if (g === 0x90) { if (type === T.DATE_INVALID) return new Date(NaN); const t = this.view.getFloat64(this.pos, true); this.pos += 8; return new Date(t); }
+    // Error (0xA0)
+    if (g === 0xA0) return this._rError(type);
+    // RegExp (0xB0)
+    if (g === 0xB0) { return new RegExp(this.readValue(), this.readValue()); }
+    // Binary (0xC0)
+    if (g === 0xC0) { this._rV(); this._rV(); return { _type: "Binary" }; }
+    // Special / Symbol (0xE0)
+    if (g === 0xE0) return this._rSpecial(type);
+    // Extension (0xF0)
+    if (g === 0xF0) return this.options.allowFunction ? function(){throw new Error("Function not serialized")} : undefined;
+
+    throw new Error(`Unknown type: 0x${type.toString(16)}`);
+  }
+
+  // ── Read: varint ──────────────────────────────────────────────────
+
+  _rV() {
+    const b = this.buffer;
+    let p = this.pos, byte = this.buf[p++];
+    if (!(byte & 0x80)) { this.pos = p; return byte; }
+    let val = byte & 0x7F, shift = 7;
+    do { byte = this.buf[p++]; val |= (byte & 0x7F) << shift; shift += 7; } while (byte & 0x80);
+    this.pos = p;
+    return val >>> 0;
+  }
+
+  // ── Read: fill containers ─────────────────────────────────────────
+
+  _rFill(val, type, g) {
+    if (g === 0x40) { // Array
+      if (type === T.ARRAY_EMPTY) return;
+      if (type === T.ARRAY_DENSE) { const n = this._rV(); for (let i = 0; i < n; i++) val[i] = this.readValue(); }
+      else if (type === T.ARRAY_SPARSE) { val.length = this._rV(); const c = this._rV(); for (let i = 0; i < c; i++) val[this._rV()] = this.readValue(); }
+      else { const d = this._rPacked(type); for (let i = 0; i < d.length; i++) val.push(d[i]); }
+    } else if (g === 0x50) { // Object
+      this.fillObject(val, type);
+    } else if (g === 0x80) { // Collection
+      const sz = this._rV();
+      if (type === T.MAP) { for (let i = 0; i < sz; i++) val.set(this.readValue(), this.readValue()); }
+      else { for (let i = 0; i < sz; i++) val.add(this.readValue()); }
+    }
+  }
+
+  fillObject(obj, type) {
+    if (type === T.OBJECT_EMPTY) return;
+    if (type === T.OBJECT_LITERAL || type === T.OBJECT_PLAIN) {
+      const n = this._rV(); for (let i = 0; i < n; i++) obj[this.readValue()] = this.readValue();
+    } else if (type === T.OBJECT_WITH_DESCRIPTORS) {
+      const n = this._rV();
+      for (let i = 0; i < n; i++) {
+        const key = this.readValue();
+        const flags = this.buffer[this.pos++];
+        const desc = { enumerable: !!(flags & 1), writable: !!(flags & 2), configurable: !!(flags & 4) };
+        if (flags & 8 || flags & 16) {
+          if (flags & 8) desc.get = this.readValue();
+          if (flags & 16) desc.set = this.readValue();
+        } else { desc.value = this.readValue(); }
+        Object.defineProperty(obj, key, desc);
+      }
+    } else if (type === T.OBJECT_WITH_METHODS) {
+      const n = this._rV();
+      for (let i = 0; i < n; i++) {
+        const key = this.readValue();
+        const isFunc = this.buffer[this.pos++];
+        if (isFunc) {
+          if (this.options.allowFunction && this.options.serializeFunctions) {
+            const src = this.readValue(); this.readValue(); // name
+            try { obj[key] = new Function("return " + src)(); } catch(e) { obj[key] = undefined; }
+          } else if (this.options.serializeFunctions) {
+            this.readValue(); this.readValue(); obj[key] = undefined;
+          } else {
+            this.pos++; // skip FUNCTION_PLACEHOLDER byte
+            obj[key] = this.options.allowFunction ? function(){throw new Error("Not serialized")} : undefined;
+          }
+        } else { obj[key] = this.readValue(); }
+      }
+    } else if (type === T.OBJECT_CONSTRUCTOR) {
+      const ctorName = this.readValue();
+      const n = this._rV();
+      for (let i = 0; i < n; i++) obj[this.readValue()] = this.readValue();
+      Object.defineProperty(obj, '__constructorName', { value: ctorName, enumerable: false, writable: false, configurable: true });
+    }
+  }
+
+  // ── Read: numbers ─────────────────────────────────────────────────
+
+  _rNum(type) {
+    const dv = this.view; let p = this.pos, v;
+    switch (type) {
+      case T.INT8: v = (this.buffer[p] << 24) >> 24; this.pos = p+1; return v;
+      case T.INT16: v = this.dv.getInt16(p, true); this.pos = p+2; return v;
+      case T.INT32: v = this.dv.getInt32(p, true); this.pos = p+4; return v;
+      case T.UINT32: v = this.dv.getUint32(p, true); this.pos = p+4; return v;
+      case T.FLOAT32: v = this.dv.getFloat32(p, true); this.pos = p+4; return v;
+      case T.FLOAT64: v = this.dv.getFloat64(p, true); this.pos = p+8; return v;
+      case T.NAN: return NaN;
+      case T.INFINITY: return Infinity;
+      case T.NEG_INFINITY: return -Infinity;
+      case T.NEG_ZERO: return -0;
+      case T.VARINT: v = this._rV(); return this.buffer[this.pos++] ? -v : v;
+    }
+  }
+
+  // ── Read: bigint ──────────────────────────────────────────────────
+
+  _rBigInt(type) {
+    if (type === T.BIGINT_POS_SMALL || type === T.BIGINT_NEG_SMALL) {
+      const v = this.view.getBigInt64(this.pos, true); this.pos += 8; return v;
+    }
+    const neg = type === T.BIGINT_NEG_LARGE;
+    const len = this._rV(); let hex = "";
+    for (let i = len - 1; i >= 0; i--) hex += this.buffer[this.pos + i].toString(16).padStart(2, "0");
+    this.pos += len;
+    const v = BigInt("0x" + (hex || "0"));
+    return neg ? -v : v;
+  }
+
+  // ── Read: strings ─────────────────────────────────────────────────
+
+  _rStr(type) {
+    if (type === T.STRING_EMPTY) return "";
+    const b = this.buffer;
+    let len;
+    if (type === T.STRING_ASCII_TINY || type === T.STRING_ASCII_SHORT ||
+        type === T.STRING_UTF8_TINY || type === T.STRING_UTF8_SHORT) {
+      len = this.buf[this.pos++];
+    } else { len = this._rV(); }
+
+    let str;
+    const isAsc = type === T.STRING_ASCII_TINY || type === T.STRING_ASCII_SHORT || type === T.STRING_ASCII_LONG;
+    if (isAsc && len < 128) {
+      str = _ascDec[len](b, this.pos);
+      this.pos += len;
+    } else {
+      str = this.dec.decode(b.subarray(this.pos, this.pos + len));
+      this.pos += len;
+    }
+    if (str.length > 3) this.deserializeStrings.push(str);
     return str;
   }
 
-  /**
-   * Read packed array data
-   * @param {number} type - Array type
-   * @returns {Array} Array data
-   */
-  readPackedArrayData(type) {
-    const length = this.readVarint();
-    const array = new Array(length);
-    
-    const elementSize = BYTES_PER_ELEMENT[type];
-    if (!elementSize) {
-      throw new Error(`Unknown packed array type: 0x${type.toString(16)}`);
-    }
-    
-    this.alignPos(Math.min(elementSize, 8));
-    this.ensureBytes(length * elementSize);
-    
+  // ── Read: packed arrays ───────────────────────────────────────────
+
+  _rPacked(type) {
+    const len = this._rV(), arr = new Array(len), dv = this.view;
+    let p = this.pos;
     switch (type) {
-      case TYPE.ARRAY_PACKED_I8:
-        for (let i = 0; i < length; i++) {
-          array[i] = this.view.getInt8(this.pos++);
-        }
-        break;
-      case TYPE.ARRAY_PACKED_I16:
-        for (let i = 0; i < length; i++) {
-          array[i] = this.view.getInt16(this.pos, true);
-          this.pos += 2;
-        }
-        break;
-      case TYPE.ARRAY_PACKED_I32:
-        for (let i = 0; i < length; i++) {
-          array[i] = this.view.getInt32(this.pos, true);
-          this.pos += 4;
-        }
-        break;
-      case TYPE.ARRAY_PACKED_F32:
-        for (let i = 0; i < length; i++) {
-          array[i] = this.view.getFloat32(this.pos, true);
-          this.pos += 4;
-        }
-        break;
-      case TYPE.ARRAY_PACKED_F64:
-        for (let i = 0; i < length; i++) {
-          array[i] = this.view.getFloat64(this.pos, true);
-          this.pos += 8;
-        }
-        break;
+      case T.ARRAY_PACKED_I8:  for (let i=0;i<len;i++) arr[i] = (this.buffer[p++]<<24)>>24; break;
+      case T.ARRAY_PACKED_I16: for (let i=0;i<len;i++) { arr[i] = this.dv.getInt16(p,true); p+=2; } break;
+      case T.ARRAY_PACKED_I32: for (let i=0;i<len;i++) { arr[i] = this.dv.getInt32(p,true); p+=4; } break;
+      case T.ARRAY_PACKED_F32: for (let i=0;i<len;i++) { arr[i] = this.dv.getFloat32(p,true); p+=4; } break;
+      case T.ARRAY_PACKED_F64: for (let i=0;i<len;i++) { arr[i] = this.dv.getFloat64(p,true); p+=8; } break;
     }
-    
-    return array;
+    this.pos = p; return arr;
   }
 
-  /**
-   * Read typed array
-   * @param {number} type - Typed array type
-   * @returns {TypedArray} Typed array
-   */
-  readTypedArray(type) {
-    const isShared = this.readU8();
-    
-    if (isShared) {
-      const bufferId = this.readVarint();
-      const byteOffset = this.readVarint();
-      const length = this.readVarint();
-      
-      if (bufferId >= this.deserializeBuffers.length) {
-        throw new Error(`Invalid buffer reference: ${bufferId}`);
-      }
-      
-      const buffer = this.deserializeBuffers[bufferId];
-      return this.createTypedArray(type, buffer, byteOffset, length);
-    } else {
-      const byteOffset = this.readVarint();
-      const length = this.readVarint();
-      const elementSize = BYTES_PER_ELEMENT[type] || 1;
-      
-      // Special handling for BigInt arrays
-      if (type == TYPE.BIGINT64ARRAY || type == TYPE.BIGUINT64ARRAY) {
-        this.alignPos(8);
-        const values = [];
-        for (let i = 0; i < length; i++) {
-          values.push(this.readBigInt64());
-        }
-        
-        const Constructor = type == TYPE.BIGINT64ARRAY ? BigInt64Array : BigUint64Array;
-        return new Constructor(values);
-      } else {
-        const totalBytes = length * elementSize;
-        
-        this.alignPos(elementSize);
-        this.ensureBytes(totalBytes);
-        
-        const data = this.buffer.subarray(this.pos, this.pos + totalBytes);
-        this.pos += totalBytes;
-        
-        // Create properly aligned buffer for typed arrays
-        const alignedBuffer = new ArrayBuffer(totalBytes);
-        const alignedBytes = new Uint8Array(alignedBuffer);
-        alignedBytes.set(data);
-        
-        this.deserializeBuffers.push(alignedBuffer);
-        
-        return this.createTypedArray(type, alignedBuffer, 0, length);
-      }
+  // ── Read: typed arrays ────────────────────────────────────────────
+
+  _rTypedArr(type) {
+    const shared = this.buffer[this.pos++];
+    if (shared) {
+      const bid = this._rV(), bo = this._rV(), len = this._rV();
+      return new (TCTOR[type])(this.deserializeBuffers[bid], bo, len);
     }
-  }
-
-  /**
-   * Create typed array from buffer
-   * @param {number} type - Typed array type
-   * @param {ArrayBuffer} buffer - Buffer
-   * @param {number} byteOffset - Byte offset
-   * @param {number} length - Length
-   * @returns {TypedArray} Typed array
-   */
-  createTypedArray(type, buffer, byteOffset, length) {
-    const constructorMap = {
-      [TYPE.UINT8ARRAY]: Uint8Array,
-      [TYPE.INT8ARRAY]: Int8Array,
-      [TYPE.UINT8CLAMPEDARRAY]: Uint8ClampedArray,
-      [TYPE.UINT16ARRAY]: Uint16Array,
-      [TYPE.INT16ARRAY]: Int16Array,
-      [TYPE.UINT32ARRAY]: Uint32Array,
-      [TYPE.INT32ARRAY]: Int32Array,
-      [TYPE.FLOAT32ARRAY]: Float32Array,
-      [TYPE.FLOAT64ARRAY]: Float64Array,
-      [TYPE.BIGINT64ARRAY]: BigInt64Array,
-      [TYPE.BIGUINT64ARRAY]: BigUint64Array,
-      [TYPE.DATAVIEW]: DataView
-    };
-    
-    const Constructor = constructorMap[type];
-    if (!Constructor) {
-      throw new Error(`Unknown typed array type: 0x${type.toString(16)}`);
+    const bo = this._rV(), len = this._rV(), es = BPE[type] || 1;
+    if (type === T.BIGINT64ARRAY || type === T.BIGUINT64ARRAY) {
+      const vals = [];
+      for (let i = 0; i < len; i++) { vals.push(this.view.getBigInt64(this.pos, true)); this.pos += 8; }
+      return new (TCTOR[type])(vals);
     }
-    
-    return new Constructor(buffer, byteOffset, length);
+    const tb = len * es;
+    const ab = new ArrayBuffer(tb);
+    new Uint8Array(ab).set(this.buffer.subarray(this.pos, this.pos + tb));
+    this.pos += tb;
+    this.deserializeBuffers.push(ab);
+    return new (TCTOR[type])(ab, 0, len);
   }
 
-  /**
-   * Read ArrayBuffer
-   * @param {number} type - Buffer type
-   * @returns {ArrayBuffer} Buffer
-   */
-  readArrayBuffer(type) {
-    const length = this.readVarint();
-    this.ensureBytes(length);
-    
-    const data = this.buffer.subarray(this.pos, this.pos + length);
-    this.pos += length;
-    
-    const buffer = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
-    this.deserializeBuffers.push(buffer);
-    
-    return buffer;
+  // ── Read: ArrayBuffer ─────────────────────────────────────────────
+
+  _rArrayBuf(type) {
+    const len = this._rV();
+    const buf = this.buffer.buffer.slice(this.buffer.byteOffset + this.pos, this.buffer.byteOffset + this.pos + len);
+    this.pos += len;
+    return buf;
   }
 
-  /**
-   * Read Date
-   * @param {number} type - Date type
-   * @returns {Date} Date
-   */
-  readDate(type) {
-    switch (type) {
-      case TYPE.DATE:
-        return new Date(this.readF64());
-      case TYPE.DATE_INVALID:
-        return new Date(NaN);
-      default:
-        throw new Error(`Unknown date type: 0x${type.toString(16)}`);
-    }
+  // ── Read: errors ──────────────────────────────────────────────────
+
+  _rError(type) {
+    const msg = this.readValue(), stack = this.readValue();
+    let err;
+    if (type === T.AGGREGATE_ERROR) {
+      const n = this._rV(), errs = [];
+      for (let i = 0; i < n; i++) errs.push(this.readValue());
+      err = new AggregateError(errs, msg);
+    } else { err = new (ERR_CTORS[type] || Error)(msg); }
+    if (stack) err.stack = stack;
+    return err;
   }
 
-  /**
-   * Read Error
-   * @param {number} type - Error type
-   * @returns {Error} Error
-   */
-  readError(type) {
-    const message = this.readValue();
-    const stack = this.readValue();
-    
-    let error;
-    const errorConstructors = {
-      [TYPE.ERROR]: Error,
-      [TYPE.EVAL_ERROR]: EvalError,
-      [TYPE.RANGE_ERROR]: RangeError,
-      [TYPE.REFERENCE_ERROR]: ReferenceError,
-      [TYPE.SYNTAX_ERROR]: SyntaxError,
-      [TYPE.TYPE_ERROR]: TypeError,
-      [TYPE.URI_ERROR]: URIError
-    };
-    
-    const ErrorConstructor = errorConstructors[type] || Error;
-    
-    if (type == TYPE.AGGREGATE_ERROR) {
-      const errorCount = this.readVarint();
-      const errors = [];
-      for (let i = 0; i < errorCount; i++) {
-        errors.push(this.readValue());
-      }
-      error = new AggregateError(errors, message);
-    } else {
-      error = new ErrorConstructor(message);
-    }
-    
-    if (stack) error.stack = stack;
-    return error;
-  }
+  // ── Read: symbols ─────────────────────────────────────────────────
 
-  /**
-   * Read RegExp
-   * @returns {RegExp} RegExp
-   */
-  readRegExp() {
-    const source = this.readValue();
-    const flags = this.readValue();
-    return new RegExp(source, flags);
-  }
-
-  /**
-   * Read binary
-   * @param {number} type - Binary type
-   * @returns {Object} Binary placeholder
-   */
-  readBinary(type) {
-    const size = this.readVarint();
-    const typeStr = this.readVarint();
-    return { _type: 'Binary', size, typeStr };
-  }
-
-  /**
-   * FIXED: Read special with proper symbol handling
-   * @param {number} type - Special type
-   * @returns {Symbol} Symbol
-   */
-  readSpecial(type) {
-    switch (type) {
-      case TYPE.SYMBOL:
-        const description = this.readValue();
-        return Symbol(description);
-      case TYPE.SYMBOL_NO_DESC:
-        return Symbol(); // Symbol without description
-      case TYPE.SYMBOL_GLOBAL:
-        const key = this.readValue();
-        return Symbol.for(key);
-      case TYPE.SYMBOL_WELLKNOWN:
-        const wellKnownName = this.readValue();
-        return WELLKNOWN_SYMBOLS_BY_NAME.get(wellKnownName) || Symbol(wellKnownName);
-      default:
-        throw new Error(`Unknown special type: 0x${type.toString(16)}`);
-    }
-  }
-
-  /**
-   * NEW: Read extension value
-   * @param {number} type - Extension type
-   * @returns {*} Extension value
-   */
-  readExtension(type) {
-    switch (type) {
-      case TYPE.FUNCTION_PLACEHOLDER:
-        // When allowFunction is false, return undefined instead of a function
-        return this.options.allowFunction
-          ? function() { throw new Error('Function not serialized'); }
-          : undefined;
-      default:
-        throw new Error(`Unknown extension type: 0x${type.toString(16)}`);
-    }
-  }
-
-  // Low-level read operations with bounds checking
-
-  /**
-   * Read unsigned 8-bit integer
-   * @returns {number} Value
-   */
-  readU8() {
-    this.ensureBytes(1);
-    return this.buffer[this.pos++];
-  }
-
-  /**
-   * Read signed 16-bit integer
-   * @returns {number} Value
-   */
-  readI16() {
-    this.alignPos(2);
-    this.ensureBytes(2);
-    const value = this.view.getInt16(this.pos, true);
-    this.pos += 2;
-    return value;
-  }
-
-  /**
-   * Read unsigned 16-bit integer
-   * @returns {number} Value
-   */
-  readU16() {
-    this.alignPos(2);
-    this.ensureBytes(2);
-    const value = this.view.getUint16(this.pos, true);
-    this.pos += 2;
-    return value;
-  }
-
-  /**
-   * Read signed 32-bit integer
-   * @returns {number} Value
-   */
-  readI32() {
-    this.alignPos(4);
-    this.ensureBytes(4);
-    const value = this.view.getInt32(this.pos, true);
-    this.pos += 4;
-    return value;
-  }
-
-  /**
-   * Read unsigned 32-bit integer
-   * @returns {number} Value
-   */
-  readU32() {
-    this.alignPos(4);
-    this.ensureBytes(4);
-    const value = this.view.getUint32(this.pos, true);
-    this.pos += 4;
-    return value;
-  }
-
-  /**
-   * Read 32-bit float
-   * @returns {number} Value
-   */
-  readF32() {
-    this.alignPos(4);
-    this.ensureBytes(4);
-    const value = this.view.getFloat32(this.pos, true);
-    this.pos += 4;
-    return value;
-  }
-
-  /**
-   * Read 64-bit float
-   * @returns {number} Value
-   */
-  readF64() {
-    this.alignPos(8);
-    this.ensureBytes(8);
-    const value = this.view.getFloat64(this.pos, true);
-    this.pos += 8;
-    return value;
-  }
-
-  /**
-   * Read BigInt64
-   * @returns {BigInt} Value
-   */
-  readBigInt64() {
-    this.alignPos(8);
-    this.ensureBytes(8);
-    const value = this.view.getBigInt64(this.pos, true);
-    this.pos += 8;
-    return value;
-  }
-
-  /**
-   * Read variable-length integer
-   * @returns {number} Value
-   */
-  readVarint() {
-    let value = 0;
-    let shift = 0;
-    let byte;
-    
-    do {
-      this.ensureBytes(1);
-      byte = this.buffer[this.pos++];
-      value |= (byte & 0x7F) << shift;
-      shift += 7;
-    } while (byte & 0x80);
-    
-    return value >>> 0;
-  }
-
-  /**
-   * Align read position
-   * @param {number} alignment - Required alignment
-   */
-  alignPos(alignment) {
-    const mask = (alignment - 1)|0;
-    this.pos = ((this.pos + mask) & ~mask) >>> 0;
-  }
-
-  /**
-   * Ensure bytes available
-   * @param {number} count - Required bytes
-   */
-  ensureBytes(count) {
-    if (this.pos + count > this.buffer.length) {
-      throw new Error(`Buffer underflow: need ${count}, available ${this.buffer.length - this.pos}`);
-    }
+  _rSpecial(type) {
+    if (type === T.SYMBOL) return Symbol(this.readValue());
+    if (type === T.SYMBOL_NO_DESC) return Symbol();
+    if (type === T.SYMBOL_GLOBAL) return Symbol.for(this.readValue());
+    if (type === T.SYMBOL_WELLKNOWN) return WELLKNOWN_BY_NAME.get(this.readValue()) || Symbol();
+    throw new Error(`Unknown special type: 0x${type.toString(16)}`);
   }
 }
 
-// Export the optimized library
 export default TurboSerial;
