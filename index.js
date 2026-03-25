@@ -1,9 +1,12 @@
 /**
- * TurboSerial v0.3.1 — Hotfix: deserialization buffer reference corrections
+ * TurboSerial v0.4.0 — Performance Optimizations
  *
- * Same API & wire-format type codes as v0.1.0.
- * Architecture: single flat class, no alignment padding, no ensure(),
- * pre-generated ASCII decoders, asm.js-style coercion.
+ * Wire-format v7: adds pre-allocation counts header (backward-reads v6).
+ * Optimizations: typed array views, single-pass circular detection,
+ * zero-alloc string encoding (encodeInto), direct BigInt byte extraction,
+ * constructor equality checks, merged packed array detect/write,
+ * fast sparse detection, monomorphic fillObject, Symbol-based ctor names,
+ * pre-allocated deserialize arrays.
  */
 "use strict";
 
@@ -100,6 +103,7 @@ const ERR_NAMES = new Map([
 ]);
 
 const MAGIC = 0x54425236; // TBR6
+const ctorSymbol = Symbol.for('__TurboSerial_Ctor');
 
 // ── TurboSerial ───────────────────────────────────────────────────────
 class TurboSerial {
@@ -122,12 +126,16 @@ class TurboSerial {
     const sz = Math.max(this.options.memoryPoolSize, 65536);
     this.buf = new Uint8Array(sz);
     this.dv = new DataView(this.buf.buffer);
+    this.f64 = new Float64Array(this.buf.buffer);
+    this.f32 = new Float32Array(this.buf.buffer);
+    this.i32 = new Int32Array(this.buf.buffer);
+    this.i16 = new Int16Array(this.buf.buffer);
     this.pos = 0;
     this.enc = new TextEncoder();
     this.dec = new TextDecoder();
     // Serialize tracking
     this.refs = new Map();
-    this.circularRefs = new Set();
+    this.ancestors = new WeakSet();
     this.strings = new Map();
     this.buffers = new Map();
     // Deserialize state
@@ -148,40 +156,65 @@ class TurboSerial {
     nb.set(this.buf.subarray(0, this.pos));
     this.buf = nb;
     this.dv = new DataView(nb.buffer);
+    this.f64 = new Float64Array(nb.buffer);
+    this.f32 = new Float32Array(nb.buffer);
+    this.i32 = new Int32Array(nb.buffer);
+    this.i16 = new Int16Array(nb.buffer);
   }
 
   // ── Public API ────────────────────────────────────────────────────
 
   serialize(value) {
     this.resetState();
-    // Header
-    this._grow(5);
+    // Header: magic(4) + version(1) + refCount(4) + strCount(4) + bufCount(4) = 17 bytes
+    this._grow(17);
     this.dv.setUint32(0, MAGIC, true);
-    this.buf[4] = 6;
-    this.pos = 5;
-    if (this.options.detectCircular) this.detectCircularReferences(value, new WeakSet());
+    this.buf[4] = 7; // Version 7: includes pre-allocation counts
+    this.pos = 17; // Skip past count placeholders
     this.writeValue(value);
+    // Patch counts into header now that we know them
+    this.dv.setUint32(5, this.refs.size, true);
+    this.dv.setUint32(9, this.strings.size, true);
+    this.dv.setUint32(13, this.buffers.size, true);
     return this.buf.slice(0, this.pos);
   }
 
   deserialize(input) {
-    this.buffer = (input instanceof Uint8Array) ? input : new Uint8Array(input);
+    this.buffer = (input.constructor === Uint8Array) ? input : new Uint8Array(input);
     this.view = new DataView(this.buffer.buffer, this.buffer.byteOffset, this.buffer.byteLength);
     this.pos = 0;
-    this.deserializeRefs = [];
-    this.deserializeStrings = [];
-    this.deserializeBuffers = [];
     const magic = this.view.getUint32(0, true);
     if (magic !== MAGIC) throw new Error("Invalid TurboSerial data");
-    if (this.buffer[4] !== 6) throw new Error(`Unsupported version: ${this.buffer[4]}`);
-    this.pos = 5;
+    const version = this.buffer[4];
+    if (version === 7) {
+      // Opt 10: Pre-allocate arrays from header counts
+      const refCount = this.view.getUint32(5, true);
+      const strCount = this.view.getUint32(9, true);
+      const bufCount = this.view.getUint32(13, true);
+      this.deserializeRefs = new Array(refCount);
+      this.deserializeStrings = new Array(strCount);
+      this.deserializeBuffers = new Array(bufCount);
+      this._drIdx = 0;
+      this._dsIdx = 0;
+      this._dbIdx = 0;
+      this.pos = 17;
+    } else if (version === 6) {
+      // Backward-compatible with v6 format
+      this.deserializeRefs = [];
+      this.deserializeStrings = [];
+      this.deserializeBuffers = [];
+      this._drIdx = -1; // sentinel: use push() mode
+      this.pos = 5;
+    } else {
+      throw new Error(`Unsupported version: ${version}`);
+    }
     return this.readValue();
   }
 
   resetState() {
     this.pos = 0;
     this.refs.clear();
-    this.circularRefs.clear();
+    this.ancestors = new WeakSet();
     this.strings.clear();
     this.buffers.clear();
   }
@@ -190,39 +223,19 @@ class TurboSerial {
     const sz = opts.shrink ? Math.max(this.options.memoryPoolSize || 65536, 256) : this.buf.length;
     this.buf = new Uint8Array(sz);
     this.dv = new DataView(this.buf.buffer);
+    this.f64 = new Float64Array(this.buf.buffer);
+    this.f32 = new Float32Array(this.buf.buffer);
+    this.i32 = new Int32Array(this.buf.buffer);
+    this.i16 = new Int16Array(this.buf.buffer);
     this.pos = 0;
     this.refs.clear();
-    this.circularRefs.clear();
+    this.ancestors = new WeakSet();
     this.strings.clear();
     this.buffers.clear();
     if (this.deserializeRefs) { this.deserializeRefs.length = 0; this.deserializeRefs = null; }
     if (this.deserializeStrings) { this.deserializeStrings.length = 0; this.deserializeStrings = null; }
     if (this.deserializeBuffers) { this.deserializeBuffers.length = 0; this.deserializeBuffers = null; }
     return this;
-  }
-
-  // ── Circular detection ────────────────────────────────────────────
-
-  detectCircularReferences(value, visited) {
-    if (typeof value !== "object" || value === null) return;
-    if (visited.has(value)) { this.circularRefs.add(value); return; }
-    visited.add(value);
-    try {
-      if (Array.isArray(value)) {
-        for (let i = 0, l = value.length; i < l; i++) {
-          if (i in value) this.detectCircularReferences(value[i], visited);
-        }
-      } else if (value instanceof Map) {
-        for (const [k,v] of value) { this.detectCircularReferences(k, visited); this.detectCircularReferences(v, visited); }
-      } else if (value instanceof Set) {
-        for (const item of value) this.detectCircularReferences(item, visited);
-      } else {
-        const keys = Object.keys(value);
-        for (let i = 0; i < keys.length; i++) {
-          try { this.detectCircularReferences(value[keys[i]], visited); } catch(e) {}
-        }
-      }
-    } finally { visited.delete(value); }
   }
 
   // ── Write: varint ─────────────────────────────────────────────────
@@ -267,28 +280,37 @@ class TurboSerial {
       return;
     }
 
-    // ── Object path ──
+    // ── Object path (single-pass circular + dedup detection) ──
 
-    // Circular ref
-    if (this.options.detectCircular && this.circularRefs.has(value)) {
-      const rid = this.refs.get(value);
-      if (rid !== undefined) { this._grow(6); this.buf[this.pos++] = T.CIRCULAR_REF; this._wV(rid); return; }
+    // Check if already seen
+    const rid = this.refs.get(value);
+    if (rid !== undefined) {
+      this._grow(6);
+      // If it's in our current ancestor stack, it's circular; otherwise it's a duplicate
+      if (this.options.detectCircular && this.ancestors.has(value)) {
+        this.buf[this.pos++] = T.CIRCULAR_REF;
+      } else {
+        this.buf[this.pos++] = T.REFERENCE;
+      }
+      this._wV(rid);
+      return;
+    }
+    // First time seeing this object — register it
+    if (this.options.deduplication || this.options.detectCircular) {
       this.refs.set(value, this.refs.size);
     }
-    // Object dedup
-    if (this.options.deduplication && !this.circularRefs.has(value)) {
-      const rid = this.refs.get(value);
-      if (rid !== undefined) { this._grow(6); this.buf[this.pos++] = T.REFERENCE; this._wV(rid); return; }
-      this.refs.set(value, this.refs.size);
-    }
+
     // ArrayBuffer sharing
-    if (this.options.shareArrayBuffers && value instanceof ArrayBuffer) {
+    if (this.options.shareArrayBuffers && value.constructor === ArrayBuffer) {
       const bid = this.buffers.get(value);
       if (bid !== undefined) { this._grow(6); this.buf[this.pos++] = T.BUFFER_REF; this._wV(bid); return; }
       this.buffers.set(value, this.buffers.size);
     }
 
+    // Track ancestors for circular detection
+    if (this.options.detectCircular) this.ancestors.add(value);
     this._wObj(value);
+    if (this.options.detectCircular) this.ancestors.delete(value);
   }
 
   // ── Write: string with dedup ──────────────────────────────────────
@@ -342,13 +364,18 @@ class TurboSerial {
       this.pos += 8;
     } else {
       this.buf[this.pos++] = neg ? T.BIGINT_NEG_LARGE : T.BIGINT_POS_LARGE;
-      let hex = abs.toString(16);
-      if (hex.length & 1) hex = "0" + hex;
-      const len = hex.length >>> 1;
-      this._grow(len + 5);
-      this._wV(len);
-      for (let i = hex.length - 2; i >= 0; i -= 2) this.buf[this.pos++] = parseInt(hex.substr(i, 2), 16);
-      if (hex.length % 2) this.buf[this.pos++] = parseInt(hex[0], 16);
+      // Direct byte extraction via bitwise shifts — no intermediate string allocation
+      let temp = abs;
+      let byteCount = 0;
+      let t2 = abs;
+      while (t2 > 0n) { byteCount++; t2 >>= 8n; }
+      this._grow(byteCount + 5);
+      this._wV(byteCount);
+      // Write bytes in little-endian order (least significant first)
+      for (let i = 0; i < byteCount; i++) {
+        this.buf[this.pos++] = Number(temp & 0xFFn);
+        temp >>= 8n;
+      }
     }
   }
 
@@ -371,29 +398,49 @@ class TurboSerial {
         this.pos = p + len;
         return;
       }
-      const enc = this.enc.encode(value);
-      const bl = enc.length;
-      this._grow(bl + 7);
+      // UTF-8 short path: max encoded length = len*3, always < 384, fits in 1-byte length
+      const maxBytes = len * 3;
+      this._grow(maxBytes + 7);
+      // Reserve 2 bytes for header (type + 1-byte length), encode directly into buffer
+      const dataStart = this.pos + 2;
+      const result = this.enc.encodeInto(value, this.buf.subarray(dataStart, dataStart + maxBytes));
+      const bl = result.written;
       let p = this.pos;
       this.buf[p++] = bl < 16 ? T.STRING_UTF8_TINY : bl < 256 ? T.STRING_UTF8_SHORT : T.STRING_UTF8_LONG;
-      if (bl < 256) { this.buf[p++] = bl; } else { this.pos = p; this._wV(bl); p = this.pos; }
-      this.buf.set(enc, p);
-      this.pos = p + bl;
+      if (bl < 256) {
+        this.buf[p++] = bl;
+        // Data already at dataStart = original pos + 2, which is p now — perfect, no shift needed
+        this.pos = dataStart + bl;
+      } else {
+        // Rare: varint length > 1 byte for short string, shift data
+        this.pos = p; this._wV(bl); p = this.pos;
+        this.buf.copyWithin(p, dataStart, dataStart + bl);
+        this.pos = p + bl;
+      }
       return;
     }
 
-    const enc = this.enc.encode(value);
-    const bl = enc.length;
-    this._grow(bl + 7);
+    // Long string path: use encodeInto with worst-case allocation
+    const maxBytes = len * 3;
+    this._grow(maxBytes + 7);
+    // Reserve max header space (6 bytes: 1 type + 5 varint), encode after that
+    const maxHeaderSize = 6;
+    const dataStart = this.pos + maxHeaderSize;
+    const result = this.enc.encodeInto(value, this.buf.subarray(dataStart, dataStart + maxBytes));
+    const bl = result.written;
     let p = this.pos;
     if (bl === len) {
+      // Pure ASCII detected by matching lengths
       this.buf[p++] = len < 256 ? T.STRING_ASCII_SHORT : T.STRING_ASCII_LONG;
       if (len < 256) { this.buf[p++] = len; } else { this.pos = p; this._wV(len); p = this.pos; }
     } else {
       this.buf[p++] = bl < 256 ? T.STRING_UTF8_SHORT : T.STRING_UTF8_LONG;
       if (bl < 256) { this.buf[p++] = bl; } else { this.pos = p; this._wV(bl); p = this.pos; }
     }
-    this.buf.set(enc, p);
+    // Shift encoded data from dataStart to right after header at p
+    if (p !== dataStart) {
+      this.buf.copyWithin(p, dataStart, dataStart + bl);
+    }
     this.pos = p + bl;
   }
 
@@ -426,7 +473,7 @@ class TurboSerial {
       if ((mapped & 0xF0) === 0x60) { this._wTypedArr(value, mapped); return; }
     }
 
-    if (value instanceof Error) {
+    if (value.constructor === Error || (value.constructor && ERR_NAMES.has(value.constructor.name))) {
       this._grow(2);
       const et = ERR_NAMES.get(value.constructor.name) || T.CUSTOM_ERROR;
       this.buf[this.pos++] = et;
@@ -439,8 +486,8 @@ class TurboSerial {
       return;
     }
 
-    if (typeof Blob !== 'undefined' && value instanceof Blob) {
-      this._grow(12); this.buf[this.pos++] = (value instanceof File) ? T.FILE : T.BLOB;
+    if (typeof Blob !== 'undefined' && (value.constructor === Blob || value.constructor === (typeof File !== 'undefined' ? File : null))) {
+      this._grow(12); this.buf[this.pos++] = (typeof File !== 'undefined' && value.constructor === File) ? T.FILE : T.BLOB;
       this._wV(0); this._wV(0);
       return;
     }
@@ -453,9 +500,9 @@ class TurboSerial {
   _wArr(arr) {
     const len = arr.length;
     if (len === 0) { this._grow(1); this.buf[this.pos++] = T.ARRAY_EMPTY; return; }
-    let sparse = false;
-    for (let i = 0; i < len; i++) { if (!(i in arr)) { sparse = true; break; } }
-    if (sparse) {
+    // Opt 7: Fast sparse detection via key-count heuristic (avoids `in` operator in loop)
+    const isSparse = Object.keys(arr).length !== len;
+    if (isSparse) {
       this._grow(12); this.buf[this.pos++] = T.ARRAY_SPARSE; this._wV(len);
       const entries = [];
       for (let i = 0; i < len; i++) { if (i in arr) entries.push(i); }
@@ -463,37 +510,38 @@ class TurboSerial {
       for (const idx of entries) { this._wV(idx); this.writeValue(arr[idx]); }
       return;
     }
+    // Opt 6: Single-pass packed detect + write
     if (this.options.simdOptimization && len >= 8 && typeof arr[0] === "number") {
-      const packed = this._detectPacked(arr, len);
-      if (packed) { this._grow(6); this.buf[this.pos++] = packed; this._wPacked(arr, len, packed); return; }
+      if (this._wPackedArr(arr, len)) return;
     }
     this._grow(6); this.buf[this.pos++] = T.ARRAY_DENSE; this._wV(len);
     for (let i = 0; i < len; i++) this.writeValue(arr[i]);
   }
 
-  _detectPacked(arr, len) {
+  // Opt 6: Merged detect + write in a single pass — returns true if packed
+  _wPackedArr(arr, len) {
     let allInt = 1, min = arr[0], max = arr[0], canF32 = 1;
     for (let i = 0; i < len; i++) {
       const v = arr[i];
-      if (typeof v !== "number") return 0;
+      if (typeof v !== "number") return false;
       if (v !== (v | 0)) allInt = 0;
       if (v < min) min = v; if (v > max) max = v;
       if (canF32) { _f32[0] = v; if (_f32[0] !== v) canF32 = 0; }
     }
+    let type;
     if (allInt) {
       const am = Math.max(Math.abs(min), Math.abs(max));
-      if (am <= 0x7F) return T.ARRAY_PACKED_I8;
-      if (am <= 0x7FFF) return T.ARRAY_PACKED_I16;
-      return T.ARRAY_PACKED_I32;
+      if (am <= 0x7F) type = T.ARRAY_PACKED_I8;
+      else if (am <= 0x7FFF) type = T.ARRAY_PACKED_I16;
+      else type = T.ARRAY_PACKED_I32;
+    } else {
+      type = canF32 ? T.ARRAY_PACKED_F32 : T.ARRAY_PACKED_F64;
     }
-    return canF32 ? T.ARRAY_PACKED_F32 : T.ARRAY_PACKED_F64;
-  }
-
-  _wPacked(arr, len, type) {
-    const dv = this.dv;
-    this._wV(len);
+    // Write header + data in one shot
     const es = BPE[type] || 1;
-    this._grow(len * es);
+    this._grow(6 + len * es);
+    this.buf[this.pos++] = type;
+    this._wV(len);
     let p = this.pos;
     switch (type) {
       case T.ARRAY_PACKED_I8:  for (let i = 0; i < len; i++) this.buf[p++] = arr[i] & 0xFF; break;
@@ -503,6 +551,7 @@ class TurboSerial {
       case T.ARRAY_PACKED_F64: for (let i = 0; i < len; i++) { this.dv.setFloat64(p, arr[i], true); p += 8; } break;
     }
     this.pos = p;
+    return true;
   }
 
   // ── Write: typed arrays ───────────────────────────────────────────
@@ -662,6 +711,20 @@ class TurboSerial {
   //   • corrupt/partial objects when stale bytes misalign the parser
   // ─────────────────────────────────────────────────────────────────
 
+  // Opt 10: Pre-alloc aware push helpers
+  _pushRef(val) {
+    if (this._drIdx >= 0) { this.deserializeRefs[this._drIdx++] = val; }
+    else { this.deserializeRefs.push(val); }
+  }
+  _pushStr(val) {
+    if (this._dsIdx >= 0) { this.deserializeStrings[this._dsIdx++] = val; }
+    else { this.deserializeStrings.push(val); }
+  }
+  _pushBuf(val) {
+    if (this._dbIdx >= 0) { this.deserializeBuffers[this._dbIdx++] = val; }
+    else { this.deserializeBuffers.push(val); }
+  }
+
   readValue() {
     const type = this.buffer[this.pos++]; // FIX: was this.buf
 
@@ -687,15 +750,15 @@ class TurboSerial {
       if (g === 0x40) val = [];
       else if (g === 0x80) val = type === T.MAP ? new Map() : new Set();
       else val = {};
-      this.deserializeRefs.push(val);
+      this._pushRef(val);
       this._rFill(val, type, g);
       return val;
     }
 
     // Typed arrays (0x60)
-    if (g === 0x60) { const v = this._rTypedArr(type); this.deserializeRefs.push(v); return v; }
+    if (g === 0x60) { const v = this._rTypedArr(type); this._pushRef(v); return v; }
     // Buffers (0x70)
-    if (g === 0x70) { const v = this._rArrayBuf(type); this.deserializeBuffers.push(v); return v; }
+    if (g === 0x70) { const v = this._rArrayBuf(type); this._pushBuf(v); return v; }
     // Date (0x90)
     if (g === 0x90) { if (type === T.DATE_INVALID) return new Date(NaN); const t = this.view.getFloat64(this.pos, true); this.pos += 8; return new Date(t); }
     // Error (0xA0)
@@ -740,45 +803,58 @@ class TurboSerial {
     }
   }
 
+  // Opt 8: Split fillObject into monomorphic sub-functions to prevent megamorphic IC
   fillObject(obj, type) {
     if (type === T.OBJECT_EMPTY) return;
-    if (type === T.OBJECT_LITERAL || type === T.OBJECT_PLAIN) {
-      const n = this._rV(); for (let i = 0; i < n; i++) obj[this.readValue()] = this.readValue();
-    } else if (type === T.OBJECT_WITH_DESCRIPTORS) {
-      const n = this._rV();
-      for (let i = 0; i < n; i++) {
-        const key = this.readValue();
-        const flags = this.buffer[this.pos++]; // FIX: was this.buf
-        const desc = { enumerable: !!(flags & 1), writable: !!(flags & 2), configurable: !!(flags & 4) };
-        if (flags & 8 || flags & 16) {
-          if (flags & 8) desc.get = this.readValue();
-          if (flags & 16) desc.set = this.readValue();
-        } else { desc.value = this.readValue(); }
-        Object.defineProperty(obj, key, desc);
-      }
-    } else if (type === T.OBJECT_WITH_METHODS) {
-      const n = this._rV();
-      for (let i = 0; i < n; i++) {
-        const key = this.readValue();
-        const isFunc = this.buffer[this.pos++]; // FIX: was this.buf
-        if (isFunc) {
-          if (this.options.allowFunction && this.options.serializeFunctions) {
-            const src = this.readValue(); this.readValue(); // name
-            try { obj[key] = new Function("return " + src)(); } catch(e) { obj[key] = undefined; }
-          } else if (this.options.serializeFunctions) {
-            this.readValue(); this.readValue(); obj[key] = undefined;
-          } else {
-            this.pos++; // skip FUNCTION_PLACEHOLDER byte
-            obj[key] = this.options.allowFunction ? function(){throw new Error("Not serialized")} : undefined;
-          }
-        } else { obj[key] = this.readValue(); }
-      }
-    } else if (type === T.OBJECT_CONSTRUCTOR) {
-      const ctorName = this.readValue();
-      const n = this._rV();
-      for (let i = 0; i < n; i++) obj[this.readValue()] = this.readValue();
-      Object.defineProperty(obj, '__constructorName', { value: ctorName, enumerable: false, writable: false, configurable: true });
+    if (type === T.OBJECT_LITERAL || type === T.OBJECT_PLAIN) { this._fillLiteralObj(obj); }
+    else if (type === T.OBJECT_WITH_DESCRIPTORS) { this._fillDescriptorObj(obj); }
+    else if (type === T.OBJECT_WITH_METHODS) { this._fillMethodObj(obj); }
+    else if (type === T.OBJECT_CONSTRUCTOR) { this._fillConstructorObj(obj); }
+  }
+
+  _fillLiteralObj(obj) {
+    const n = this._rV(); for (let i = 0; i < n; i++) obj[this.readValue()] = this.readValue();
+  }
+
+  _fillDescriptorObj(obj) {
+    const n = this._rV();
+    for (let i = 0; i < n; i++) {
+      const key = this.readValue();
+      const flags = this.buffer[this.pos++];
+      const desc = { enumerable: !!(flags & 1), writable: !!(flags & 2), configurable: !!(flags & 4) };
+      if (flags & 8 || flags & 16) {
+        if (flags & 8) desc.get = this.readValue();
+        if (flags & 16) desc.set = this.readValue();
+      } else { desc.value = this.readValue(); }
+      Object.defineProperty(obj, key, desc);
     }
+  }
+
+  _fillMethodObj(obj) {
+    const n = this._rV();
+    for (let i = 0; i < n; i++) {
+      const key = this.readValue();
+      const isFunc = this.buffer[this.pos++];
+      if (isFunc) {
+        if (this.options.allowFunction && this.options.serializeFunctions) {
+          const src = this.readValue(); this.readValue(); // name
+          try { obj[key] = new Function("return " + src)(); } catch(e) { obj[key] = undefined; }
+        } else if (this.options.serializeFunctions) {
+          this.readValue(); this.readValue(); obj[key] = undefined;
+        } else {
+          this.pos++; // skip FUNCTION_PLACEHOLDER byte
+          obj[key] = this.options.allowFunction ? function(){throw new Error("Not serialized")} : undefined;
+        }
+      } else { obj[key] = this.readValue(); }
+    }
+  }
+
+  // Opt 9: Use Symbol instead of Object.defineProperty to avoid dictionary mode
+  _fillConstructorObj(obj) {
+    const ctorName = this.readValue();
+    const n = this._rV();
+    for (let i = 0; i < n; i++) obj[this.readValue()] = this.readValue();
+    obj[ctorSymbol] = ctorName;
   }
 
   // ── Read: numbers ─────────────────────────────────────────────────
@@ -834,7 +910,7 @@ class TurboSerial {
       str = this.dec.decode(b.subarray(this.pos, this.pos + len));
       this.pos += len;
     }
-    if (str.length > 3) this.deserializeStrings.push(str);
+    if (str.length > 3) this._pushStr(str);
     return str;
   }
 
@@ -871,7 +947,7 @@ class TurboSerial {
     const ab = new ArrayBuffer(tb);
     new Uint8Array(ab).set(this.buffer.subarray(this.pos, this.pos + tb));
     this.pos += tb;
-    this.deserializeBuffers.push(ab);
+    this._pushBuf(ab);
     return new (TCTOR[type])(ab, 0, len);
   }
 
@@ -909,4 +985,5 @@ class TurboSerial {
   }
 }
 
+export { ctorSymbol };
 export default TurboSerial;
