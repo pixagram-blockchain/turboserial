@@ -490,8 +490,29 @@ class TurboSerial {
   // ── Write: numbers ────────────────────────────────────────────────
 
   _wNum(v) {
+    // T2.3 — fast path for small non-negative ints (0..127). Covers IDs,
+    // array indices, ages, counts, percentages, day-of-month, port subsets,
+    // ASCII byte values — the bulk of integer-typed object fields.
+    //
+    // The guard does, in order:
+    //   * v >= 0       — rejects negatives, NaN (NaN compared to anything is false)
+    //   * v < 128      — rejects Infinity, large ints
+    //   * (v | 0) === v — rejects fractions; also true for -0 (which we filter)
+    //   * 1/v >= 0     — rejects -0 (1/-0 === -Infinity)
+    //
+    // For v=0 specifically: 1/0 = Infinity ≥ 0 → fast path. Good.
+    // For v=-0:             1/-0 = -Infinity, the !(1/v >= 0) test fires → slow path.
+    if (v >= 0 && v < 128 && (v | 0) === v && 1/v >= 0) {
+      this._grow(2);
+      const p = this.pos;
+      this.buf[p] = T.INT8;
+      this.buf[p+1] = v;
+      this.pos = p + 2;
+      return;
+    }
+
     this._grow(10);
-    
+
     let p = this.pos;
     if (v !== v) { this.buf[p] = T.NAN; this.pos = p+1; return; }
     if (v === Infinity) { this.buf[p] = T.INFINITY; this.pos = p+1; return; }
