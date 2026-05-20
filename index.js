@@ -21,6 +21,130 @@ for (let n = 0; n < 128; n++) {
 // ── Float32 precision scratch ─────────────────────────────────────────
 const _f32 = new Float32Array(1);
 
+// ── Base64 codec (for data:*/*;base64,... string compaction) ──────────
+// Adapted from beatgammit/base64-js. Decodes/encodes directly into a
+// caller-supplied Uint8Array to avoid intermediate allocations.
+const _b64Lookup = new Uint8Array(64);
+const _b64RevLookup = new Int8Array(256).fill(-1);
+{
+  const code = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  for (let i = 0; i < 64; i++) {
+    const c = code.charCodeAt(i);
+    _b64Lookup[i] = c;
+    _b64RevLookup[c] = i;
+  }
+  // URL-safe variants
+  _b64RevLookup['-'.charCodeAt(0)] = 62;
+  _b64RevLookup['_'.charCodeAt(0)] = 63;
+}
+
+// Compute decoded byte length for a base64 string slice [start, end) in `src`.
+// Returns -1 if the slice is not valid base64 (bad length or invalid char).
+function _b64DecodedLen(src, start, end) {
+  const len = end - start;
+  if (len === 0 || (len & 3) !== 0) return -1;
+  // Find '=' padding
+  let validLen = len;
+  if (src.charCodeAt(end - 1) === 0x3D) {
+    validLen--;
+    if (src.charCodeAt(end - 2) === 0x3D) validLen--;
+  }
+  // Quick charset validation: scan once, also confirms no internal '='
+  for (let i = start; i < start + validLen; i++) {
+    if (_b64RevLookup[src.charCodeAt(i)] < 0) return -1;
+  }
+  const placeHoldersLen = len - validLen;
+  return ((validLen + placeHoldersLen) * 3 >> 2) - placeHoldersLen;
+}
+
+// Decode base64 from `src[start..end)` directly into `dst[dstPos..]`.
+// Returns the number of bytes written. Caller must have validated via _b64DecodedLen.
+function _b64DecodeInto(src, start, end, dst, dstPos) {
+  const rev = _b64RevLookup;
+  const len = end - start;
+  let validLen = len;
+  if (src.charCodeAt(end - 1) === 0x3D) {
+    validLen--;
+    if (src.charCodeAt(end - 2) === 0x3D) validLen--;
+  }
+  const placeHoldersLen = len - validLen;
+  const fullLen = placeHoldersLen > 0 ? validLen - 4 : validLen;
+  let curByte = dstPos;
+  let i = start;
+  const fullEnd = start + fullLen;
+  for (; i < fullEnd; i += 4) {
+    const tmp =
+      (rev[src.charCodeAt(i)]     << 18) |
+      (rev[src.charCodeAt(i + 1)] << 12) |
+      (rev[src.charCodeAt(i + 2)] <<  6) |
+       rev[src.charCodeAt(i + 3)];
+    dst[curByte++] = (tmp >> 16) & 0xFF;
+    dst[curByte++] = (tmp >>  8) & 0xFF;
+    dst[curByte++] =  tmp        & 0xFF;
+  }
+  if (placeHoldersLen === 2) {
+    const tmp =
+      (rev[src.charCodeAt(i)]     << 2) |
+      (rev[src.charCodeAt(i + 1)] >> 4);
+    dst[curByte++] = tmp & 0xFF;
+  } else if (placeHoldersLen === 1) {
+    const tmp =
+      (rev[src.charCodeAt(i)]     << 10) |
+      (rev[src.charCodeAt(i + 1)] <<  4) |
+      (rev[src.charCodeAt(i + 2)] >>  2);
+    dst[curByte++] = (tmp >> 8) & 0xFF;
+    dst[curByte++] =  tmp       & 0xFF;
+  }
+  return curByte - dstPos;
+}
+
+// Encode `src[srcPos..srcPos+byteLen)` to base64. Returns a String.
+// Uses String.fromCharCode chunking, same approach as fromByteArray.
+function _b64EncodeFrom(src, srcPos, byteLen) {
+  const lk = _b64Lookup;
+  const extraBytes = byteLen % 3;
+  const fullLen = byteLen - extraBytes;
+  // 4 base64 chars per 3 src bytes + padding for tail
+  const outLen = ((byteLen + 2) / 3 | 0) * 4;
+  const out = new Uint8Array(outLen);
+  let o = 0;
+  const end = srcPos + fullLen;
+  for (let i = srcPos; i < end; i += 3) {
+    const tmp =
+      ((src[i]     << 16) & 0xFF0000) |
+      ((src[i + 1] <<  8) & 0x00FF00) |
+       (src[i + 2]        & 0x0000FF);
+    out[o++] = lk[(tmp >> 18) & 0x3F];
+    out[o++] = lk[(tmp >> 12) & 0x3F];
+    out[o++] = lk[(tmp >>  6) & 0x3F];
+    out[o++] = lk[ tmp        & 0x3F];
+  }
+  if (extraBytes === 1) {
+    const tmp = src[srcPos + byteLen - 1];
+    out[o++] = lk[tmp >> 2];
+    out[o++] = lk[(tmp << 4) & 0x3F];
+    out[o++] = 0x3D; // '='
+    out[o++] = 0x3D; // '='
+  } else if (extraBytes === 2) {
+    const tmp = (src[srcPos + byteLen - 2] << 8) | src[srcPos + byteLen - 1];
+    out[o++] = lk[tmp >> 10];
+    out[o++] = lk[(tmp >> 4) & 0x3F];
+    out[o++] = lk[(tmp << 2) & 0x3F];
+    out[o++] = 0x3D; // '='
+  }
+  // Build string in chunks to avoid arg-count limits on fromCharCode
+  let result = "";
+  const CHUNK = 8192;
+  for (let i = 0; i < outLen; i += CHUNK) {
+    result += String.fromCharCode.apply(null, out.subarray(i, Math.min(i + CHUNK, outLen)));
+  }
+  return result;
+}
+
+// Min base64 payload length to bother with the data-URI compaction path.
+// Below this, the header overhead eats the savings.
+const _DATA_URI_MIN_PAYLOAD = 32;
+
 // ── Well-known symbols ────────────────────────────────────────────────
 const WELLKNOWN_SYMBOLS = new Map();
 const WELLKNOWN_BY_NAME = new Map();
@@ -40,6 +164,7 @@ const T = {
   BIGINT_POS_SMALL:0x20,BIGINT_NEG_SMALL:0x21,BIGINT_POS_LARGE:0x22,BIGINT_NEG_LARGE:0x23,
   STRING_EMPTY:0x30,STRING_ASCII_TINY:0x31,STRING_ASCII_SHORT:0x32,STRING_ASCII_LONG:0x33,
   STRING_UTF8_TINY:0x34,STRING_UTF8_SHORT:0x35,STRING_UTF8_LONG:0x36,STRING_REF:0x37,
+  STRING_DATA_URI_B64:0x38,
   ARRAY_EMPTY:0x40,ARRAY_DENSE:0x41,ARRAY_SPARSE:0x42,
   ARRAY_PACKED_I8:0x43,ARRAY_PACKED_I16:0x44,ARRAY_PACKED_I32:0x45,
   ARRAY_PACKED_F32:0x46,ARRAY_PACKED_F64:0x47,
@@ -117,11 +242,28 @@ class TurboSerial {
       allowFunction: options.allowFunction || false,
       serializeFunctions: options.serializeFunctions || false,
       preservePropertyDescriptors: options.preservePropertyDescriptors !== false,
+      assumePlainObjects: options.assumePlainObjects || false,
       sortKeys: options.sortKeys || false,
       memoryPoolSize: options.memoryPoolSize || 65536,
       ...options
     };
     if (!this.options.allowFunction) this.options.serializeFunctions = false;
+
+    // T1.4 — hoist hot options into direct instance fields. Property
+    // chains like `this.options.deduplication` are megamorphic on the
+    // options object's hidden class and add ~5 ns per access; direct
+    // instance booleans are one inline load. Read by writeValue / _wObj
+    // / _wStrDedup / _wPlainObj on every value, so this matters.
+    const o = this.options;
+    this._dedup            = o.deduplication;
+    this._detectCircular   = o.detectCircular;
+    this._shareBufs        = o.shareArrayBuffers;
+    this._allowFn          = o.allowFunction;
+    this._serializeFn      = o.serializeFunctions;
+    this._preserveDescs    = o.preservePropertyDescriptors;
+    this._assumePlain      = o.assumePlainObjects;
+    this._sortKeys         = o.sortKeys;
+    this._simd             = o.simdOptimization;
 
     const sz = Math.max(this.options.memoryPoolSize, 65536);
     this.buf = new Uint8Array(sz);
@@ -164,7 +306,9 @@ class TurboSerial {
 
   // ── Public API ────────────────────────────────────────────────────
 
-  serialize(value) {
+  // Internal: writes header + value into this.buf, leaves this.pos at end.
+  // Used by both serialize() (which copies) and serializeView() (zero-copy).
+  _writeAll(value) {
     this.resetState();
     // Header: magic(4) + version(1) + refCount(4) + strCount(4) + bufCount(4) = 17 bytes
     this._grow(17);
@@ -176,7 +320,21 @@ class TurboSerial {
     this.dv.setUint32(5, this.refs.size, true);
     this.dv.setUint32(9, this.strings.size, true);
     this.dv.setUint32(13, this.buffers.size, true);
+  }
+
+  serialize(value) {
+    this._writeAll(value);
     return this.buf.slice(0, this.pos);
+  }
+
+  // Zero-copy variant. Returns a subarray view into the internal buffer.
+  // The returned view is INVALIDATED on the next serialize/serializeView
+  // call on this instance (the buffer may be overwritten or reallocated).
+  // Use this when handing bytes directly to a sink (network/disk write,
+  // hash, base64-encode) that won't retain them past the next call.
+  serializeView(value) {
+    this._writeAll(value);
+    return this.buf.subarray(0, this.pos);
   }
 
   deserialize(input) {
@@ -276,7 +434,7 @@ class TurboSerial {
 
     if (tp === "function") {
       this._grow(1);
-      this.buf[this.pos++] = this.options.allowFunction ? T.FUNCTION_PLACEHOLDER : T.UNDEFINED;
+      this.buf[this.pos++] = this._allowFn ? T.FUNCTION_PLACEHOLDER : T.UNDEFINED;
       return;
     }
 
@@ -287,7 +445,7 @@ class TurboSerial {
     if (rid !== undefined) {
       this._grow(6);
       // If it's in our current ancestor stack, it's circular; otherwise it's a duplicate
-      if (this.options.detectCircular && this.ancestors.has(value)) {
+      if (this._detectCircular && this.ancestors.has(value)) {
         this.buf[this.pos++] = T.CIRCULAR_REF;
       } else {
         this.buf[this.pos++] = T.REFERENCE;
@@ -296,27 +454,27 @@ class TurboSerial {
       return;
     }
     // First time seeing this object — register it
-    if (this.options.deduplication || this.options.detectCircular) {
+    if (this._dedup || this._detectCircular) {
       this.refs.set(value, this.refs.size);
     }
 
     // ArrayBuffer sharing
-    if (this.options.shareArrayBuffers && value.constructor === ArrayBuffer) {
+    if (this._shareBufs && value.constructor === ArrayBuffer) {
       const bid = this.buffers.get(value);
       if (bid !== undefined) { this._grow(6); this.buf[this.pos++] = T.BUFFER_REF; this._wV(bid); return; }
       this.buffers.set(value, this.buffers.size);
     }
 
     // Track ancestors for circular detection
-    if (this.options.detectCircular) this.ancestors.add(value);
+    if (this._detectCircular) this.ancestors.add(value);
     this._wObj(value);
-    if (this.options.detectCircular) this.ancestors.delete(value);
+    if (this._detectCircular) this.ancestors.delete(value);
   }
 
   // ── Write: string with dedup ──────────────────────────────────────
 
   _wStrDedup(value) {
-    if (this.options.deduplication && value.length > 3) {
+    if (this._dedup && value.length > 3) {
       const sid = this.strings.get(value);
       if (sid !== undefined) {
         this._grow(6);
@@ -386,6 +544,41 @@ class TurboSerial {
 
     if (len === 0) { this._grow(1); this.buf[this.pos++] = T.STRING_EMPTY; return; }
 
+    // ── Data-URI base64 fast path ──
+    // If the string is `data:<mime>;base64,<payload>` and the payload is
+    // valid base64, store it as: [opcode][varint headerLen][header ASCII]
+    // [varint binLen][raw decoded bytes]. Saves ~25% on the payload.
+    if (len > 64 && value.charCodeAt(0) === 0x64 /* 'd' */ &&
+        value.charCodeAt(1) === 0x61 /* 'a' */ &&
+        value.charCodeAt(2) === 0x74 /* 't' */ &&
+        value.charCodeAt(3) === 0x61 /* 'a' */ &&
+        value.charCodeAt(4) === 0x3A /* ':' */) {
+      const markerIdx = value.indexOf(';base64,', 5);
+      if (markerIdx > 5) {
+        const payloadStart = markerIdx + 8; // length of ';base64,'
+        const headerEnd = payloadStart;     // header = "data:...;base64,"
+        const payloadLen = len - payloadStart;
+        if (payloadLen >= _DATA_URI_MIN_PAYLOAD) {
+          const binLen = _b64DecodedLen(value, payloadStart, len);
+          if (binLen > 0) {
+            // Layout: [opcode] [varint headerLen] [headerLen ASCII bytes]
+            //         [varint binLen] [binLen raw bytes]
+            this._grow(1 + 5 + headerEnd + 5 + binLen);
+            this.buf[this.pos++] = T.STRING_DATA_URI_B64;
+            this._wV(headerEnd);
+            // Header is guaranteed ASCII (data:<mime>;base64,)
+            let p = this.pos;
+            for (let i = 0; i < headerEnd; i++) this.buf[p + i] = value.charCodeAt(i);
+            this.pos = p + headerEnd;
+            this._wV(binLen);
+            const written = _b64DecodeInto(value, payloadStart, len, this.buf, this.pos);
+            this.pos += written;
+            return;
+          }
+        }
+      }
+    }
+
     if (len < 128) {
       let ascii = 1;
       for (let i = 0; i < len; i++) { if (value.charCodeAt(i) > 0x7F) { ascii = 0; break; } }
@@ -447,10 +640,32 @@ class TurboSerial {
   // ── Write: objects (dispatch) ─────────────────────────────────────
 
   _wObj(value) {
-    
+
     if (Array.isArray(value)) { this._wArr(value); return; }
 
     const ctor = value.constructor;
+
+    // ── Fast path: plain object literal ──
+    // {a:1, b:2} → ctor === Object. This is the overwhelmingly common
+    // case for JSON-like data. Skip CTOR_MAP/error/Blob checks AND skip
+    // the full _wPlainObj protocol scans when the object is "trivial":
+    // no symbols, no functions (when allowFunction is off), and either
+    // descriptor preservation is off OR opted out via assumePlainObjects.
+    if (ctor === Object) {
+      // Fast path is taken when:
+      //   * allowFunction is false (no method-scan needed)
+      //   * EITHER preservePropertyDescriptors is false
+      //     OR assumePlainObjects is true (caller opts into trust)
+      // Otherwise fall through to the conservative _wPlainObj.
+      if (!this._allowFn && (!this._preserveDescs || this._assumePlain)) {
+        this._wFastPlainObj(value);
+        return;
+      }
+      // Slow path still beats the dispatcher chain — go straight to _wPlainObj
+      this._wPlainObj(value);
+      return;
+    }
+
     const mapped = CTOR_MAP.get(ctor);
     if (mapped !== undefined) {
       if (mapped === T.DATE) {
@@ -511,7 +726,7 @@ class TurboSerial {
       return;
     }
     // Opt 6: Single-pass packed detect + write
-    if (this.options.simdOptimization && len >= 8 && typeof arr[0] === "number") {
+    if (this._simd && len >= 8 && typeof arr[0] === "number") {
       if (this._wPackedArr(arr, len)) return;
     }
     this._grow(6); this.buf[this.pos++] = T.ARRAY_DENSE; this._wV(len);
@@ -560,7 +775,7 @@ class TurboSerial {
     this._grow(12);
     this.buf[this.pos++] = type;
     const buffer = arr.buffer;
-    if (this.options.shareArrayBuffers) {
+    if (this._shareBufs) {
       const bid = this.buffers.get(buffer);
       if (bid !== undefined) {
         this.buf[this.pos++] = 1; // shared flag
@@ -599,7 +814,7 @@ class TurboSerial {
       return;
     }
 
-    if (this.options.preservePropertyDescriptors) {
+    if (this._preserveDescs) {
       // Check for complex descriptors
       const allKeys = [...Object.getOwnPropertyNames(obj), ...Object.getOwnPropertySymbols(obj)];
       let hasComplex = false;
@@ -612,7 +827,7 @@ class TurboSerial {
 
     // Check for methods
     let hasMethods = false;
-    if (this.options.allowFunction) {
+    if (this._allowFn) {
       for (let i = 0; i < keys.length; i++) {
         if (typeof obj[keys[i]] === "function") { hasMethods = true; break; }
       }
@@ -622,29 +837,53 @@ class TurboSerial {
     // Simple object
     this._grow(6);
     this.buf[this.pos++] = T.OBJECT_LITERAL;
-    if (this.options.sortKeys) keys.sort();
+    if (this._sortKeys) keys.sort();
     // Count non-function keys
     let count = keys.length;
-    if (!this.options.serializeFunctions) {
+    if (!this._serializeFn) {
       count = 0;
       for (let i = 0; i < keys.length; i++) { if (typeof obj[keys[i]] !== "function") count++; }
     }
     this._wV(count);
     for (let i = 0; i < keys.length; i++) {
       const v = obj[keys[i]];
-      if (!this.options.serializeFunctions && typeof v === "function") continue;
+      if (!this._serializeFn && typeof v === "function") continue;
       this.writeValue(keys[i]);
       this.writeValue(v);
+    }
+  }
+
+  // ── Fast plain-object writer ──
+  // Caller (_wObj) has already proven:
+  //   * obj.constructor === Object
+  //   * options.allowFunction is false (so no method/function handling)
+  //   * descriptor preservation is disabled or opted-out
+  // Skips: getPrototypeOf, isPlain check, descriptor scan, methods scan,
+  //        function-filtering count loop, sortKeys (which can be added if needed).
+  // Result: one Object.keys() + one tight write loop.
+  _wFastPlainObj(obj) {
+    const keys = Object.keys(obj);
+    const n = keys.length;
+    if (n === 0) { this._grow(1); this.buf[this.pos++] = T.OBJECT_EMPTY; return; }
+    this._grow(6);
+    this.buf[this.pos++] = T.OBJECT_LITERAL;
+    if (this._sortKeys) keys.sort();
+    this._wV(n);
+    for (let i = 0; i < n; i++) {
+      const k = keys[i];
+      this.writeValue(k);
+      this.writeValue(obj[k]);
     }
   }
 
   _wDescriptorObj(obj, allKeys) {
     this._grow(6);
     this.buf[this.pos++] = T.OBJECT_WITH_DESCRIPTORS;
+    const serializeFn = this._serializeFn;
     const serializable = allKeys.filter(k => {
       try {
         const d = Object.getOwnPropertyDescriptor(obj, k);
-        return d && (this.options.serializeFunctions || (!d.get && !d.set && typeof d.value !== "function"));
+        return d && (serializeFn || (!d.get && !d.set && typeof d.value !== "function"));
       } catch(e) { return false; }
     });
     this._wV(serializable.length);
@@ -671,10 +910,11 @@ class TurboSerial {
       } catch(e) {}
     }
     this._wV(entries.length);
+    const serializeFn = this._serializeFn;
     for (const [k, v, isFunc] of entries) {
       this.writeValue(k);
       this._grow(1); this.buf[this.pos++] = isFunc ? 1 : 0;
-      if (isFunc && this.options.serializeFunctions) {
+      if (isFunc && serializeFn) {
         this.writeValue(v.toString());
         this.writeValue(v.name || "");
       } else if (!isFunc) {
@@ -689,7 +929,7 @@ class TurboSerial {
     this._grow(6);
     this.buf[this.pos++] = T.OBJECT_CONSTRUCTOR;
     this.writeValue(obj.constructor?.name || "");
-    const sk = this.options.serializeFunctions
+    const sk = this._serializeFn
       ? keys
       : keys.filter(k => { try { return typeof obj[k] !== "function"; } catch(e) { return false; } });
     this._wV(sk.length);
@@ -770,7 +1010,7 @@ class TurboSerial {
     // Special / Symbol (0xE0)
     if (g === 0xE0) return this._rSpecial(type);
     // Extension (0xF0)
-    if (g === 0xF0) return this.options.allowFunction ? function(){throw new Error("Function not serialized")} : undefined;
+    if (g === 0xF0) return this._allowFn ? function(){throw new Error("Function not serialized")} : undefined;
 
     throw new Error(`Unknown type: 0x${type.toString(16)}`);
   }
@@ -836,14 +1076,14 @@ class TurboSerial {
       const key = this.readValue();
       const isFunc = this.buffer[this.pos++];
       if (isFunc) {
-        if (this.options.allowFunction && this.options.serializeFunctions) {
+        if (this._allowFn && this._serializeFn) {
           const src = this.readValue(); this.readValue(); // name
           try { obj[key] = new Function("return " + src)(); } catch(e) { obj[key] = undefined; }
-        } else if (this.options.serializeFunctions) {
+        } else if (this._serializeFn) {
           this.readValue(); this.readValue(); obj[key] = undefined;
         } else {
           this.pos++; // skip FUNCTION_PLACEHOLDER byte
-          obj[key] = this.options.allowFunction ? function(){throw new Error("Not serialized")} : undefined;
+          obj[key] = this._allowFn ? function(){throw new Error("Not serialized")} : undefined;
         }
       } else { obj[key] = this.readValue(); }
     }
@@ -895,6 +1135,26 @@ class TurboSerial {
   _rStr(type) {
     if (type === T.STRING_EMPTY) return "";
     const b = this.buffer;
+
+    // ── Data-URI base64 fast path ──
+    if (type === T.STRING_DATA_URI_B64) {
+      const headerLen = this._rV();
+      // Header is ASCII; use the pre-generated decoder when it fits.
+      let header;
+      if (headerLen < 128) {
+        header = _ascDec[headerLen](b, this.pos);
+      } else {
+        header = this.dec.decode(b.subarray(this.pos, this.pos + headerLen));
+      }
+      this.pos += headerLen;
+      const binLen = this._rV();
+      const payload = _b64EncodeFrom(b, this.pos, binLen);
+      this.pos += binLen;
+      const str = header + payload;
+      if (str.length > 3) this._pushStr(str);
+      return str;
+    }
+
     let len;
     if (type === T.STRING_ASCII_TINY || type === T.STRING_ASCII_SHORT ||
         type === T.STRING_UTF8_TINY || type === T.STRING_UTF8_SHORT) {

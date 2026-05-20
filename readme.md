@@ -1,4 +1,4 @@
-# TurboSerial V 0.2.0 - Ultra-Optimized JavaScript Serializer
+# TurboSerial V 0.3.4 - Ultra-Optimized JavaScript Serializer
  
 ![Logo](https://github.com/pixagram-blockchain/turboserial/blob/main/logo.jpg?raw=true)
  
