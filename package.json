@@ -1,6 +1,6 @@
 {
   "name": "@pixagram/turboserial",
-  "version": "0.3.5",
+  "version": "0.4.1",
   "description": "Ultra-optimized JavaScript serializer with comprehensive type support and circular reference handling",
   "devDependencies": {
     "@babel/core": "^7.23.6",
